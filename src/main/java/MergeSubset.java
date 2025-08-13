@@ -53,7 +53,7 @@ public class MergeSubset {
     // Schemas
     private static final String SCHEMA_LIMS     = "lims";
     private static final String SCHEMA_LABBENCH = "labbench";
-    private static final String SCHEMA_MERGE    = "lims_merge";
+    private static final String SCHEMA_MERGE    = "limsdev";
 
     // Tables with simple integer PK
     private static final Map<String, String> TABLE_PK = new LinkedHashMap<>();
