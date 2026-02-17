@@ -1,0 +1,94 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.labbench'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.mysql:mysql-connector-j:8.2.0'
+    implementation 'org.xerial:sqlite-jdbc:3.42.0.0'
+    implementation 'org.slf4j:slf4j-api:1.7.36'
+    implementation 'ch.qos.logback:logback-classic:1.2.12'
+}
+
+application {
+    mainClass = 'com.labbench.merger.DatabaseMerger'
+}
+
+// ─── Custom Gradle tasks for plan and merge ─────────────────────────
+
+// Shared: build args from project properties or fall back to properties file
+def dbArgs = { String mode ->
+    def db1 = project.findProperty('db1') ?: ''
+    def db2 = project.findProperty('db2') ?: ''
+    def target = project.findProperty('target') ?: ''
+    def dbUser = project.findProperty('dbUser') ?: ''
+    def dbPassword = project.findProperty('dbPassword') ?: ''
+    def propsFile = project.findProperty('config') ?: ''
+
+    def params = [db1, db2, target].findAll { it != '' }
+
+    if (params.size() >= 3) {
+        // Full CLI args: mode + urls + optional creds
+        def result = [mode, db1, db2, target]
+        if (dbUser) result.add(dbUser)
+        if (dbPassword) result.add(dbPassword)
+        return result
+    } else if (propsFile) {
+        // Properties file specified
+        return [propsFile]
+    } else {
+        // Mode only — let the app find merger.properties
+        return [mode]
+    }
+}
+
+task plan(type: JavaExec) {
+    description = 'Run merge plan analysis (read-only) on two LabBench databases.'
+    group = 'labbench'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.labbench.merger.DatabaseMerger'
+    doFirst {
+        args = dbArgs('plan')
+    }
+}
+
+task merge(type: JavaExec) {
+    description = 'Perform actual merge of two LabBench databases into a target database.'
+    group = 'labbench'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.labbench.merger.DatabaseMerger'
+    doFirst {
+        args = dbArgs('merge')
+    }
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': 'com.labbench.merger.DatabaseMerger'
+    }
+}
+
+// Fat jar task for standalone distribution
+task fatJar(type: Jar) {
+    archiveClassifier = 'all'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'com.labbench.merger.DatabaseMerger'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    with jar
+}

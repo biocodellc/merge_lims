@@ -1,81 +1,159 @@
-# Merge LIMS
+# LabBench Database Merger
 
-This project merges tables from two MySQL databases (`lims` and `labbench`) into a combined database (`lims_merge`).
+Merges two LabBench databases (schema version 11.0) into a third target database with full deduplication support and foreign key integrity.
 
-## Prerequisites
+## Overview
 
-- **Java 11** or later  
-  Verify with:
-  ```bash
-  java -version
-  ```
-- **Maven 3.6+**  
-  Verify with:
-  ```bash
-  mvn -v
-  ```
-- Access to the MySQL servers for `lims`, `labbench`, and the merge target (`lims_merge`).
+The merger operates in four phases:
 
-## Setup
+1. **Version Validation & Properties** — Validates both databases share the same schema version, then merges property values (summing counters, preserving shared identifiers).
 
-1. **Clone the repository**  
-   ```bash
-   git clone <repo_url>
-   cd merge_lims
-   ```
+2. **Cocktail Table Deduplication** — Compares `cyclesequencing_cocktail` and `pcr_cocktail` rows field-by-field. Duplicates are mapped to existing target IDs; unique rows get new auto-increment IDs.
 
-2. **Configure environment variables**  
-   Copy the example `.env` file and fill in your connection details:
-   ```bash
-   cp env.example .env
-   ```
-   Example `.env`:
-   ```env
-   SRC_HOST=127.0.0.1
-   SRC_PORT=your_port
-   SRC_USER=your_username
-   SRC_PASS=your_password
-   SRC_SCHEMA=lims
+3. **Thermocycle Hierarchy Deduplication** — Compares complete `thermocycle → cycle → state` hierarchies as a unit. Two thermocycles are duplicates only if name, all cycles (repeats, order), and all states (temp, length, order) match exactly. If notes differ between matched hierarchies, they are concatenated in the target.
 
-   DST_HOST=<do_host>
-   DST_PORT=<do_port>
-   DST_USER=<do_user>
-   DST_PASS=<do_password>
-   DST_SCHEMA=lims_merge
-   ```
+4. **Sequential Table Copy with Offset** — Remaining tables are copied in foreign-key dependency order. DB1 rows keep original IDs. DB2 rows get offset IDs (`original_id + DB1_row_count`). Foreign keys are adjusted using either offsets (non-deduplicated references) or mappings (deduplicated references).
 
-3. **Ensure the merge schema exists**  
-   If needed, create the destination schema from the LIMS schema:
-   ```bash
-   mysql -h <MERGE_HOST> -P <MERGE_PORT> -u <MERGE_USER> -p --ssl-mode=REQUIRED      -e "CREATE DATABASE IF NOT EXISTS lims_merge;"
-   ```
+## Table Copy Order
+
+| Tier | Tables | Dependencies |
+|------|--------|-------------|
+| Setup | `databaseversion`, `properties` | None |
+| Dedup | `cyclesequencing_cocktail`, `pcr_cocktail` | None |
+| Dedup | `thermocycle`, `cycle`, `state` | cycle→thermocycle, state→cycle |
+| Tier 1 | `failure_reason`, `gelimages`, `pcr_thermocycle`, `cyclesequencing_thermocycle` | None / plate |
+| Tier 2 | `plate`, `extraction`, `workflow` | plate→thermocycle, extraction→plate, workflow→extraction |
+| Tier 3 | `gel_quantification`, `assembly`, `pcr`, `cyclesequencing` | Multiple FKs |
+| Tier 4 | `traces`, `sequencing_result` | cyclesequencing, assembly |
+
+## Foreign Key Mapping
+
+For DB2 records, foreign keys are resolved as follows:
+
+| FK Column | Strategy | Source |
+|-----------|----------|--------|
+| `thermocycle` | Mapping lookup | `thermocycleMap` |
+| `cycle` (in pcr/cs_thermocycle) | Mapping lookup | `thermocycleMap` |
+| `cocktail` (in pcr) | Mapping lookup | `pcrCocktailMap` |
+| `cocktail` (in cyclesequencing) | Mapping lookup | `cscocktailMap` |
+| `plate` | Offset | `db1Count["plate"]` |
+| `extraction` / `extractionId` | Offset | `db1Count["extraction"]` |
+| `workflow` | Offset | `db1Count["workflow"]` |
+| `failure_reason` | Offset | `db1Count["failure_reason"]` |
+| `reaction` (in traces) | Offset | `db1Count["cyclesequencing"]` |
+| `assembly` (in seq_result) | Offset | `db1Count["assembly"]` |
+
+## Workflow Name Handling
+
+Workflow names follow the pattern `LOCUS_workflowXX`. To avoid duplicates, DB2 workflow numbers are offset by the maximum number found in DB1 for the same locus. If conflicts remain after offsetting, the merge aborts.
 
 ## Build
 
-Compile the project with Maven:
 ```bash
-mvn clean package
+cd db-merger
+gradle build
+
+# Build fat JAR for standalone distribution
+gradle fatJar
 ```
 
-This produces:
-```
-target/merge-subset-1.0-SNAPSHOT.jar
-```
+## Usage
 
-## Run
+### Properties File (recommended)
 
-Execute the merge:
+Edit `merger.properties` with your database URLs and credentials, then:
+
 ```bash
-java -jar target/merge-subset-1.0-SNAPSHOT.jar
+# Plan mode
+gradle plan
+
+# Merge mode
+gradle merge
+
+# Or specify a different properties file
+gradle plan -Pconfig=/path/to/my-config.properties
 ```
 
-The tool will:
-- Connect to both source databases (`lims` and `labbench`).
-- Copy shared/global tables to the merge schema.
-- Merge plate-level data according to project logic.
+Example `merger.properties`:
+```properties
+db1.url=jdbc:sqlite:/path/to/database1.db
+db2.url=jdbc:sqlite:/path/to/database2.db
+target.url=jdbc:sqlite:/path/to/merged.db
+db.username=
+db.password=
+```
 
-## Notes
+### Gradle with CLI Properties
 
-- You must have **read access** to `lims` and `labbench` schemas and **write access** to the `merge` schema.
-- Use `--no-data` dumps to clone structure if the merge schema is missing.
-- Errors like “table doesn’t exist” usually mean you haven’t created the target schema.
+```bash
+gradle plan \
+  -Pdb1=jdbc:sqlite:/path/to/db1.db \
+  -Pdb2=jdbc:sqlite:/path/to/db2.db \
+  -Ptarget=jdbc:sqlite:/path/to/target.db
+
+gradle merge \
+  -Pdb1=jdbc:mysql://localhost:3306/labbench1 \
+  -Pdb2=jdbc:mysql://localhost:3306/labbench2 \
+  -Ptarget=jdbc:mysql://localhost:3306/labbench_merged \
+  -PdbUser=myuser \
+  -PdbPassword=mypass
+```
+
+### Fat JAR (standalone)
+
+```bash
+# Uses merger.properties in current directory
+java -jar build/libs/db-merger-1.0.0-all.jar plan
+java -jar build/libs/db-merger-1.0.0-all.jar merge
+
+# Specify properties file
+java -jar build/libs/db-merger-1.0.0-all.jar plan /path/to/merger.properties
+
+# Full CLI args (legacy)
+java -jar build/libs/db-merger-1.0.0-all.jar plan <db1-url> <db2-url> <target-url> [username] [password]
+```
+
+## Example Plan Output
+
+```
+═══════════════════════════════════════════════════════════════════════════
+  LABBENCH DATABASE MERGE PLAN
+═══════════════════════════════════════════════════════════════════════════
+
+  VERSION VALIDATION
+───────────────────────────────────────────────────────────────────────────
+  DB1 version:          11
+  DB2 version:          11
+  Versions match:       YES ✓
+
+  DEDUPLICATION ANALYSIS
+───────────────────────────────────────────────────────────────────────────
+  Table                              DB1      DB2    Dupes   Target
+  cyclesequencing_cocktail             5        4        2        7
+  pcr_cocktail                         3        3        1        5
+  thermocycle                          2        2        1        3
+
+  ALL TABLE RECORD COUNTS
+───────────────────────────────────────────────────────────────────────────
+  Table                              DB1      DB2   Target
+  ...
+
+═══════════════════════════════════════════════════════════════════════════
+  RESULT: Merge CAN proceed ✓
+═══════════════════════════════════════════════════════════════════════════
+```
+
+## Error Conditions
+
+| Condition | Behavior |
+|-----------|----------|
+| Version mismatch | Abort with error message |
+| `fullDatabaseVersion` mismatch | Abort with error message |
+| Duplicate `extraction.extractionId` between DBs | Abort with error message |
+| Duplicate `plate.name` between DBs | Abort with error message |
+| Workflow name conflict after rename | Abort with error message |
+| SQL error during merge | Rollback all changes, abort |
+
+## Logging
+
+Set log level in `src/main/resources/logback.xml`. DEBUG level shows individual ID mappings; INFO shows phase-level progress.
