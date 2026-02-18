@@ -51,8 +51,12 @@ public class DatabaseMerger {
         String db1Url = null;
         String db2Url = null;
         String targetUrl = null;
-        String username = null;
-        String password = null;
+        String db1Username = null;
+        String db1Password = null;
+        String db2Username = null;
+        String db2Password = null;
+        String targetUsername = null;
+        String targetPassword = null;
 
         // First arg is always the mode
         mode = args[0].toLowerCase();
@@ -72,24 +76,42 @@ public class DatabaseMerger {
                 db1Url = props.getProperty("db1.url");
                 db2Url = props.getProperty("db2.url");
                 targetUrl = props.getProperty("target.url");
-                username = props.getProperty("db.username");
-                password = props.getProperty("db.password");
-                // Treat empty strings as null
-                if (username != null && username.trim().isEmpty()) username = null;
-                if (password != null && password.trim().isEmpty()) password = null;
+
+                // Per-database credentials (fall back to shared credentials)
+                String sharedUser = trimToNull(props.getProperty("db.username"));
+                String sharedPass = trimToNull(props.getProperty("db.password"));
+                db1Username = trimToNull(props.getProperty("db1.username"));
+                db1Password = trimToNull(props.getProperty("db1.password"));
+                db2Username = trimToNull(props.getProperty("db2.username"));
+                db2Password = trimToNull(props.getProperty("db2.password"));
+                targetUsername = trimToNull(props.getProperty("target.username"));
+                targetPassword = trimToNull(props.getProperty("target.password"));
+
+                // Fall back to shared credentials if per-db not set
+                if (db1Username == null) db1Username = sharedUser;
+                if (db1Password == null) db1Password = sharedPass;
+                if (db2Username == null) db2Username = sharedUser;
+                if (db2Password == null) db2Password = sharedPass;
+                if (targetUsername == null) targetUsername = sharedUser;
+                if (targetPassword == null) targetPassword = sharedPass;
+
                 log.info("Loaded configuration from {}", propsFile.getAbsolutePath());
             } catch (java.io.IOException e) {
                 log.warn("Failed to load properties file: {}", e.getMessage());
             }
         }
 
-        // CLI args override properties file (legacy support)
+        // CLI args override properties file (legacy support — shared credentials only)
         if (args.length >= 4) {
             db1Url = args[1];
             db2Url = args[2];
             targetUrl = args[3];
-            if (args.length > 4) username = args[4];
-            if (args.length > 5) password = args[5];
+            if (args.length > 4) {
+                db1Username = db2Username = targetUsername = args[4];
+            }
+            if (args.length > 5) {
+                db1Password = db2Password = targetPassword = args[5];
+            }
         }
 
         if (!mode.equals("plan") && !mode.equals("merge")) {
@@ -109,10 +131,14 @@ public class DatabaseMerger {
         try {
             switch (mode) {
                 case "plan":
-                    merger.runPlan(db1Url, db2Url, targetUrl, username, password);
+                    merger.runPlan(db1Url, db1Username, db1Password,
+                                  db2Url, db2Username, db2Password,
+                                  targetUrl, targetUsername, targetPassword);
                     break;
                 case "merge":
-                    merger.runMerge(db1Url, db2Url, targetUrl, username, password);
+                    merger.runMerge(db1Url, db1Username, db1Password,
+                                   db2Url, db2Username, db2Password,
+                                   targetUrl, targetUsername, targetPassword);
                     break;
             }
         } catch (Exception e) {
@@ -122,18 +148,34 @@ public class DatabaseMerger {
         }
     }
 
+    private static String trimToNull(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
     private static void printUsage() {
         System.out.println("Usage:");
         System.out.println("  java -jar db-merger.jar <plan|merge>                                      # uses merger.properties");
         System.out.println("  java -jar db-merger.jar <plan|merge> <properties-file>                    # uses specified properties file");
-        System.out.println("  java -jar db-merger.jar <plan|merge> <db1> <db2> <target> [user] [pass]   # all from CLI");
+        System.out.println("  java -jar db-merger.jar <plan|merge> <db1> <db2> <target> [user] [pass]   # all from CLI (shared credentials)");
         System.out.println();
         System.out.println("Properties file format (merger.properties):");
         System.out.println("  db1.url=jdbc:sqlite:/path/to/db1.db");
         System.out.println("  db2.url=jdbc:sqlite:/path/to/db2.db");
         System.out.println("  target.url=jdbc:sqlite:/path/to/target.db");
-        System.out.println("  db.username=");
-        System.out.println("  db.password=");
+        System.out.println();
+        System.out.println("  # Per-database credentials (optional, override shared):");
+        System.out.println("  db1.username=user1");
+        System.out.println("  db1.password=pass1");
+        System.out.println("  db2.username=user2");
+        System.out.println("  db2.password=pass2");
+        System.out.println("  target.username=user3");
+        System.out.println("  target.password=pass3");
+        System.out.println();
+        System.out.println("  # Or shared credentials (used when per-db not set):");
+        System.out.println("  db.username=shareduser");
+        System.out.println("  db.password=sharedpass");
     }
 
     // ─── Connection helper ─────────────────────────────────────────────
@@ -423,12 +465,13 @@ public class DatabaseMerger {
 
     // ─── Plan Mode ─────────────────────────────────────────────────────
 
-    public void runPlan(String db1Url, String db2Url, String targetUrl,
-                        String username, String password) throws Exception {
+    public void runPlan(String db1Url, String db1Username, String db1Password,
+                        String db2Url, String db2Username, String db2Password,
+                        String targetUrl, String targetUsername, String targetPassword) throws Exception {
         log.info("Running merge plan analysis...");
 
-        try (Connection conn1 = connect(db1Url, username, password);
-             Connection conn2 = connect(db2Url, username, password)) {
+        try (Connection conn1 = connect(db1Url, db1Username, db1Password);
+             Connection conn2 = connect(db2Url, db2Username, db2Password)) {
 
             MergePlan plan = buildPlan(conn1, conn2);
             plan.printReport();
@@ -1019,13 +1062,14 @@ public class DatabaseMerger {
     //  MERGE MODE
     // ═══════════════════════════════════════════════════════════════════
 
-    public void runMerge(String db1Url, String db2Url, String targetUrl,
-                         String username, String password) throws Exception {
+    public void runMerge(String db1Url, String db1Username, String db1Password,
+                         String db2Url, String db2Username, String db2Password,
+                         String targetUrl, String targetUsername, String targetPassword) throws Exception {
         log.info("Starting database merge...");
 
-        try (Connection conn1 = connect(db1Url, username, password);
-             Connection conn2 = connect(db2Url, username, password);
-             Connection target = connect(targetUrl, username, password)) {
+        try (Connection conn1 = connect(db1Url, db1Username, db1Password);
+             Connection conn2 = connect(db2Url, db2Username, db2Password);
+             Connection target = connect(targetUrl, targetUsername, targetPassword)) {
 
             conn1.setAutoCommit(true); // read-only sources
             conn2.setAutoCommit(true);

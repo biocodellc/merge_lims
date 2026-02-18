@@ -77,10 +77,20 @@ gradle plan -Pconfig=/path/to/my-config.properties
 Example `merger.properties`:
 ```properties
 db1.url=jdbc:sqlite:/path/to/database1.db
+db1.username=
+db1.password=
+
 db2.url=jdbc:sqlite:/path/to/database2.db
+db2.username=
+db2.password=
+
 target.url=jdbc:sqlite:/path/to/merged.db
-db.username=
-db.password=
+target.username=
+target.password=
+
+# Shared credentials (fallback when per-database not set):
+# db.username=shareduser
+# db.password=sharedpass
 ```
 
 ### Gradle with CLI Properties
