@@ -328,7 +328,7 @@ public class MergePlan {
         System.out.printf("  Extraction IDs unique: %s%n", extractionIdsUnique ? "YES ✓" : "NO ✗");
         if (!extractionIdsUnique) {
             System.out.printf("    Detail: %s%n", extractionIdConflictDetail);
-            System.out.println("    All duplicate extractionIds:");
+            System.out.println("    Duplicate extractions (extractionId | DB1: plate / well | DB2: plate / well):");
             for (String eid : duplicateExtractionIds) {
                 System.out.println("      - " + eid);
             }

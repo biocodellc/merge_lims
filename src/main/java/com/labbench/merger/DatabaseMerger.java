@@ -767,25 +767,74 @@ public class DatabaseMerger {
     }
 
     private void checkExtractionIdUniqueness(Connection conn1, Connection conn2, MergePlan plan) throws SQLException {
+        // Build a set of DB1 extraction IDs
         Set<String> db1Ids = new HashSet<>();
         try (Statement stmt = conn1.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT extractionId FROM extraction")) {
             while (rs.next()) db1Ids.add(rs.getString("extractionId"));
         }
-        List<String> conflicts = new ArrayList<>();
-        try (Statement stmt = conn2.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT extractionId FROM extraction")) {
+
+        // Find duplicates in DB2, collecting plate name and well location from both DBs
+        String detailQuery =
+                "SELECT e.extractionId, e.location, p.name AS plateName " +
+                "FROM extraction e JOIN plate p ON e.plate = p.id";
+
+        // Load DB1 extraction details for duplicates
+        Map<String, List<String>> db1Details = new HashMap<>();
+        try (Statement stmt = conn1.createStatement();
+             ResultSet rs = stmt.executeQuery(detailQuery)) {
             while (rs.next()) {
                 String eid = rs.getString("extractionId");
-                if (db1Ids.contains(eid)) conflicts.add(eid);
+                if (db1Ids.contains(eid)) {
+                    String plateName = rs.getString("plateName");
+                    int location = rs.getInt("location");
+                    String well = wellLocationToString(location);
+                    db1Details.computeIfAbsent(eid, k -> new ArrayList<>())
+                            .add(plateName + " / " + well);
+                }
             }
         }
+
+        // Check DB2 for duplicates
+        List<String> conflicts = new ArrayList<>();
+        List<String> detailedConflicts = new ArrayList<>();
+        try (Statement stmt = conn2.createStatement();
+             ResultSet rs = stmt.executeQuery(detailQuery)) {
+            while (rs.next()) {
+                String eid = rs.getString("extractionId");
+                if (db1Ids.contains(eid)) {
+                    String plateName = rs.getString("plateName");
+                    int location = rs.getInt("location");
+                    String well = wellLocationToString(location);
+                    if (!conflicts.contains(eid)) {
+                        conflicts.add(eid);
+                    }
+                    // Format: extractionId | DB1: plate/well | DB2: plate/well
+                    List<String> db1Locs = db1Details.getOrDefault(eid, Collections.singletonList("unknown"));
+                    for (String db1Loc : db1Locs) {
+                        detailedConflicts.add(eid + "  DB1: " + db1Loc + "  |  DB2: " + plateName + " / " + well);
+                    }
+                }
+            }
+        }
+
         if (!conflicts.isEmpty()) {
             plan.setExtractionIdsUnique(false);
             plan.setExtractionIdConflictDetail(conflicts.size() + " duplicate extractionId(s) found between DB1 and DB2");
-            plan.getDuplicateExtractionIds().addAll(conflicts);
+            plan.getDuplicateExtractionIds().addAll(detailedConflicts);
             plan.addError("Duplicate extraction.extractionId values found between DB1 and DB2");
         }
+    }
+
+    /**
+     * Convert a 0-based well index on a 96-well plate (12 columns) to standard notation.
+     * 0=A1, 1=A2, ..., 11=A12, 12=B1, etc.
+     */
+    private static String wellLocationToString(int location) {
+        int row = location / 12;
+        int col = location % 12;
+        char rowLetter = (char) ('A' + row);
+        return "" + rowLetter + (col + 1);
     }
 
     private void checkPlateNameUniqueness(Connection conn1, Connection conn2, MergePlan plan) throws SQLException {
