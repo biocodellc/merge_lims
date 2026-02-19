@@ -278,44 +278,31 @@ public class MergePlan {
             for (String n : pcrCocktailDupNameList) System.out.println("      - " + n);
         }
 
-        // ID Mapping details
-        System.out.println();
-        System.out.println("  ID MAPPING DETAILS");
-        System.out.println(thin);
+        // Duplicates found
+        List<String> csDupes = new ArrayList<>();
+        for (String m : cscocktailMappings) { if (m.contains("[DUPLICATE]")) csDupes.add(m); }
+        List<String> pcrDupes = new ArrayList<>();
+        for (String m : pcrCocktailMappings) { if (m.contains("[DUPLICATE]")) pcrDupes.add(m); }
+        List<String> tcDupes = new ArrayList<>();
+        for (String m : thermocycleMappings) { if (m.contains("[DUPLICATE]")) tcDupes.add(m); }
 
-        if (!cscocktailMappings.isEmpty()) {
-            System.out.println("  Cyclesequencing Cocktail Mappings:");
-            for (String m : cscocktailMappings) System.out.println("    " + m);
-        } else {
-            System.out.println("  Cyclesequencing Cocktail Mappings: (none)");
-        }
+        if (!csDupes.isEmpty() || !pcrDupes.isEmpty() || !tcDupes.isEmpty()) {
+            System.out.println();
+            System.out.println("  DUPLICATE DETAILS");
+            System.out.println(thin);
 
-        if (!pcrCocktailMappings.isEmpty()) {
-            System.out.println("  PCR Cocktail Mappings:");
-            for (String m : pcrCocktailMappings) System.out.println("    " + m);
-        } else {
-            System.out.println("  PCR Cocktail Mappings: (none)");
-        }
-
-        if (!thermocycleMappings.isEmpty()) {
-            System.out.println("  Thermocycle Mappings:");
-            for (String m : thermocycleMappings) System.out.println("    " + m);
-        } else {
-            System.out.println("  Thermocycle Mappings: (none)");
-        }
-
-        if (!cycleMappings.isEmpty()) {
-            System.out.println("  Cycle Mappings:");
-            for (String m : cycleMappings) System.out.println("    " + m);
-        } else {
-            System.out.println("  Cycle Mappings: (none)");
-        }
-
-        if (!stateMappings.isEmpty()) {
-            System.out.println("  State Mappings:");
-            for (String m : stateMappings) System.out.println("    " + m);
-        } else {
-            System.out.println("  State Mappings: (none)");
+            if (!csDupes.isEmpty()) {
+                System.out.println("  Cyclesequencing Cocktail (" + csDupes.size() + " duplicate(s)):");
+                for (String m : csDupes) System.out.println("    " + m);
+            }
+            if (!pcrDupes.isEmpty()) {
+                System.out.println("  PCR Cocktail (" + pcrDupes.size() + " duplicate(s)):");
+                for (String m : pcrDupes) System.out.println("    " + m);
+            }
+            if (!tcDupes.isEmpty()) {
+                System.out.println("  Thermocycle (" + tcDupes.size() + " duplicate(s)):");
+                for (String m : tcDupes) System.out.println("    " + m);
+            }
         }
 
         // All table counts
