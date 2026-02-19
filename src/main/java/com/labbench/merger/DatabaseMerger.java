@@ -470,23 +470,45 @@ public class DatabaseMerger {
                         String targetUrl, String targetUsername, String targetPassword) throws Exception {
         log.info("Running merge plan analysis...");
 
+        Connection targetConn = null;
         try (Connection conn1 = connect(db1Url, db1Username, db1Password);
              Connection conn2 = connect(db2Url, db2Username, db2Password)) {
 
-            MergePlan plan = buildPlan(conn1, conn2);
+            // Only connect to target for MySQL permission checks
+            if (!isSQLite(targetUrl)) {
+                targetConn = connect(targetUrl, targetUsername, targetPassword);
+            }
+
+            MergePlan plan = buildPlan(conn1, conn2, db1Url, db2Url, targetUrl, targetConn);
             plan.printReport();
 
             if (!plan.canProceed()) {
                 System.exit(1);
             }
+        } finally {
+            if (targetConn != null) {
+                try { targetConn.close(); } catch (SQLException ignored) {}
+            }
         }
     }
 
-    private MergePlan buildPlan(Connection conn1, Connection conn2) throws SQLException {
+    private MergePlan buildPlan(Connection conn1, Connection conn2,
+                               String db1Url, String db2Url, String targetUrl,
+                               Connection targetConn) throws SQLException {
         MergePlan plan = new MergePlan();
 
+        // 0. Permission checks (MySQL only)
+        log.info("[Plan  1/10] Checking database permissions...");
+        checkPermissions(conn1, db1Url, "DB1", new String[]{"SELECT"}, plan);
+        checkPermissions(conn2, db2Url, "DB2", new String[]{"SELECT"}, plan);
+        if (targetConn != null) {
+            checkPermissions(targetConn, targetUrl, "Target", new String[]{"SELECT", "INSERT", "CREATE"}, plan);
+        } else if (isSQLite(targetUrl)) {
+            plan.getPermissionResults().add("Target (SQLite): full access assumed");
+        }
+
         // 1. Version validation
-        log.info("[Plan 1/9] Validating database versions...");
+        log.info("[Plan  2/10] Validating database versions...");
         plan.setDb1Version(getDatabaseVersion(conn1));
         plan.setDb2Version(getDatabaseVersion(conn2));
         plan.setVersionsMatch(plan.getDb1Version() == plan.getDb2Version());
@@ -495,7 +517,7 @@ public class DatabaseMerger {
         }
 
         // 2. Properties
-        log.info("[Plan 2/9] Reading properties...");
+        log.info("[Plan  3/10] Reading properties...");
         plan.setDb1FullVersion(getStringProperty(conn1, "fullDatabaseVersion"));
         plan.setDb2FullVersion(getStringProperty(conn2, "fullDatabaseVersion"));
         plan.setFullVersionsMatch(Objects.equals(plan.getDb1FullVersion(), plan.getDb2FullVersion()));
@@ -509,7 +531,7 @@ public class DatabaseMerger {
         plan.setDb2BackgroundTasksFailed(getLongProperty(conn2, "numberOfTimesBackgroundTasksFailed"));
 
         // 3. Count all tables
-        log.info("[Plan 3/9] Counting records in all tables...");
+        log.info("[Plan  4/10] Counting records in all tables...");
         for (String table : MergePlan.ALL_TABLES) {
             try {
                 plan.getDb1Counts().put(table, countRows(conn1, table));
@@ -525,32 +547,105 @@ public class DatabaseMerger {
         log.info("  Counted {} tables in both databases", MergePlan.ALL_TABLES.size());
 
         // 4. Simulate cyclesequencing_cocktail deduplication
-        log.info("[Plan 4/9] Analyzing cyclesequencing_cocktail deduplication...");
+        log.info("[Plan  5/10] Analyzing cyclesequencing_cocktail deduplication...");
         simulateCsCocktailDedup(conn1, conn2, plan);
 
         // 5. Simulate pcr_cocktail deduplication
-        log.info("[Plan 5/9] Analyzing pcr_cocktail deduplication...");
+        log.info("[Plan  6/10] Analyzing pcr_cocktail deduplication...");
         simulatePcrCocktailDedup(conn1, conn2, plan);
 
         // 6. Simulate thermocycle hierarchy deduplication
-        log.info("[Plan 6/9] Analyzing thermocycle hierarchy deduplication...");
+        log.info("[Plan  7/10] Analyzing thermocycle hierarchy deduplication...");
         simulateThermocycleDedup(conn1, conn2, plan);
 
         // 7. Check extraction ID uniqueness
-        log.info("[Plan 7/9] Checking extraction ID uniqueness...");
+        log.info("[Plan  8/10] Checking extraction ID uniqueness...");
         checkExtractionIdUniqueness(conn1, conn2, plan);
 
         // 8. Check plate name uniqueness
-        log.info("[Plan 8/9] Checking plate name uniqueness...");
+        log.info("[Plan  9/10] Checking plate name uniqueness...");
         checkPlateNameUniqueness(conn1, conn2, plan);
 
         // 9. Check workflow name conflicts
-        log.info("[Plan 9/9] Checking workflow name conflicts...");
+        log.info("[Plan 10/10] Checking workflow name conflicts...");
         checkWorkflowNameConflicts(conn1, conn2, plan);
 
         log.info("Plan analysis complete.");
 
         return plan;
+    }
+
+    // ─── Permission checking (MySQL only) ────────────────────────────
+
+    /**
+     * Check MySQL permissions for a given connection. Parses SHOW GRANTS output
+     * to verify the required privileges are present. For SQLite, this is skipped.
+     */
+    private void checkPermissions(Connection conn, String url, String label,
+                                  String[] requiredPrivileges, MergePlan plan) {
+        if (isSQLite(url)) {
+            plan.getPermissionResults().add(label + " (SQLite): full access assumed");
+            return;
+        }
+
+        // MySQL: extract database name from URL
+        String dbName = dbNameFromUrl(url);
+
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SHOW GRANTS FOR CURRENT_USER()")) {
+
+            // Collect all grant lines
+            List<String> grants = new ArrayList<>();
+            while (rs.next()) {
+                grants.add(rs.getString(1).toUpperCase());
+            }
+
+            // Check each required privilege
+            List<String> missing = new ArrayList<>();
+            for (String priv : requiredPrivileges) {
+                String privUpper = priv.toUpperCase();
+                boolean found = false;
+                for (String grant : grants) {
+                    // Check for ALL PRIVILEGES or the specific privilege
+                    // Grants can be on *.* (global), dbname.* (database), or dbname.table
+                    if (grant.contains("ALL PRIVILEGES")) {
+                        if (grant.contains("ON *.*") ||
+                            grant.contains("ON `" + dbName.toUpperCase() + "`.*") ||
+                            grant.contains("ON `" + dbName + "`.*")) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (grant.contains(privUpper)) {
+                        if (grant.contains("ON *.*") ||
+                            grant.contains("ON `" + dbName.toUpperCase() + "`.*") ||
+                            grant.contains("ON `" + dbName + "`.*")) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    missing.add(priv);
+                }
+            }
+
+            if (missing.isEmpty()) {
+                plan.getPermissionResults().add(label + " (" + dbName + "): OK — has " +
+                        String.join(", ", requiredPrivileges));
+            } else {
+                String msg = label + " (" + dbName + "): MISSING — " + String.join(", ", missing);
+                plan.getPermissionResults().add(msg);
+                plan.addError("Insufficient permissions on " + label + ": missing " +
+                        String.join(", ", missing) + " on database '" + dbName + "'");
+            }
+
+        } catch (SQLException e) {
+            // SHOW GRANTS might fail if user lacks even that privilege
+            String msg = label + " (" + dbName + "): UNABLE TO CHECK — " + e.getMessage();
+            plan.getPermissionResults().add(msg);
+            plan.addWarning("Could not verify permissions on " + label + ": " + e.getMessage());
+        }
     }
 
     // ─── Dedup simulation helpers ──────────────────────────────────────
@@ -566,7 +661,32 @@ public class DatabaseMerger {
                         "primerConc, primerAmount, extraItem, extraItemAmount, templateAmount FROM cyclesequencing_cocktail ORDER BY id");
 
         int dupes = 0;
-        // Find duplicate names between DB1 and DB2
+        // First pass: identify full-row duplicates
+        Set<Integer> fullDupeDb2Ids = new HashSet<>();
+        for (Map<String, Object> r2 : db2Rows) {
+            int db2Id = ((Number) r2.get("id")).intValue();
+            Map<String, Object> r2Comp = extractCompFields(r2, compFields);
+            for (Map<String, Object> r1 : db1Rows) {
+                Map<String, Object> r1Comp = extractCompFields(r1, compFields);
+                if (rowsEqual(r1Comp, r2Comp)) {
+                    fullDupeDb2Ids.add(db2Id);
+                    int db1Id = ((Number) r1.get("id")).intValue();
+                    plan.getCscocktailMappings().add(
+                            "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> existing DB1 id=" + db1Id + " [DUPLICATE]");
+                    dupes++;
+                    break;
+                }
+            }
+        }
+        for (Map<String, Object> r2 : db2Rows) {
+            int db2Id = ((Number) r2.get("id")).intValue();
+            if (!fullDupeDb2Ids.contains(db2Id)) {
+                plan.getCscocktailMappings().add(
+                        "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> new auto-increment id [UNIQUE]");
+            }
+        }
+
+        // Find shared names, then exclude those where ALL DB2 rows with that name are full duplicates
         Set<String> db1CsNames = new HashSet<>();
         for (Map<String, Object> r1 : db1Rows) {
             Object n = r1.get("name");
@@ -574,34 +694,15 @@ public class DatabaseMerger {
         }
         Set<String> csDupNames = new LinkedHashSet<>();
         for (Map<String, Object> r2 : db2Rows) {
+            int db2Id = ((Number) r2.get("id")).intValue();
             Object n = r2.get("name");
-            if (n != null && db1CsNames.contains(n.toString())) {
+            if (n != null && db1CsNames.contains(n.toString()) && !fullDupeDb2Ids.contains(db2Id)) {
                 csDupNames.add(n.toString());
             }
         }
         plan.setCscocktailDuplicateNames(csDupNames.size());
         plan.getCscocktailDupNameList().addAll(csDupNames);
 
-        for (Map<String, Object> r2 : db2Rows) {
-            int db2Id = ((Number) r2.get("id")).intValue();
-            Map<String, Object> r2Comp = extractCompFields(r2, compFields);
-            boolean matched = false;
-            for (Map<String, Object> r1 : db1Rows) {
-                Map<String, Object> r1Comp = extractCompFields(r1, compFields);
-                if (rowsEqual(r1Comp, r2Comp)) {
-                    int db1Id = ((Number) r1.get("id")).intValue();
-                    plan.getCscocktailMappings().add(
-                            "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> existing DB1 id=" + db1Id + " [DUPLICATE]");
-                    dupes++;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                plan.getCscocktailMappings().add(
-                        "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> new auto-increment id [UNIQUE]");
-            }
-        }
         plan.setCscocktailDuplicates(dupes);
         plan.setCscocktailUnique((int) (db2Rows.size() - dupes));
     }
@@ -620,7 +721,32 @@ public class DatabaseMerger {
                         "extraItem, extraItemAmount, templateAmount FROM pcr_cocktail ORDER BY id");
 
         int dupes = 0;
-        // Find duplicate names between DB1 and DB2
+        // First pass: identify full-row duplicates
+        Set<Integer> fullDupeDb2Ids = new HashSet<>();
+        for (Map<String, Object> r2 : db2Rows) {
+            int db2Id = ((Number) r2.get("id")).intValue();
+            Map<String, Object> r2Comp = extractCompFields(r2, compFields);
+            for (Map<String, Object> r1 : db1Rows) {
+                Map<String, Object> r1Comp = extractCompFields(r1, compFields);
+                if (rowsEqual(r1Comp, r2Comp)) {
+                    fullDupeDb2Ids.add(db2Id);
+                    int db1Id = ((Number) r1.get("id")).intValue();
+                    plan.getPcrCocktailMappings().add(
+                            "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> existing DB1 id=" + db1Id + " [DUPLICATE]");
+                    dupes++;
+                    break;
+                }
+            }
+        }
+        for (Map<String, Object> r2 : db2Rows) {
+            int db2Id = ((Number) r2.get("id")).intValue();
+            if (!fullDupeDb2Ids.contains(db2Id)) {
+                plan.getPcrCocktailMappings().add(
+                        "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> new auto-increment id [UNIQUE]");
+            }
+        }
+
+        // Find shared names, then exclude those where ALL DB2 rows with that name are full duplicates
         Set<String> db1PcrNames = new HashSet<>();
         for (Map<String, Object> r1 : db1Rows) {
             Object n = r1.get("name");
@@ -628,34 +754,15 @@ public class DatabaseMerger {
         }
         Set<String> pcrDupNames = new LinkedHashSet<>();
         for (Map<String, Object> r2 : db2Rows) {
+            int db2Id = ((Number) r2.get("id")).intValue();
             Object n = r2.get("name");
-            if (n != null && db1PcrNames.contains(n.toString())) {
+            if (n != null && db1PcrNames.contains(n.toString()) && !fullDupeDb2Ids.contains(db2Id)) {
                 pcrDupNames.add(n.toString());
             }
         }
         plan.setPcrCocktailDuplicateNames(pcrDupNames.size());
         plan.getPcrCocktailDupNameList().addAll(pcrDupNames);
 
-        for (Map<String, Object> r2 : db2Rows) {
-            int db2Id = ((Number) r2.get("id")).intValue();
-            Map<String, Object> r2Comp = extractCompFields(r2, compFields);
-            boolean matched = false;
-            for (Map<String, Object> r1 : db1Rows) {
-                Map<String, Object> r1Comp = extractCompFields(r1, compFields);
-                if (rowsEqual(r1Comp, r2Comp)) {
-                    int db1Id = ((Number) r1.get("id")).intValue();
-                    plan.getPcrCocktailMappings().add(
-                            "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> existing DB1 id=" + db1Id + " [DUPLICATE]");
-                    dupes++;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                plan.getPcrCocktailMappings().add(
-                        "DB2 id=" + db2Id + " ('" + r2.get("name") + "') -> new auto-increment id [UNIQUE]");
-            }
-        }
         plan.setPcrCocktailDuplicates(dupes);
         plan.setPcrCocktailUnique((int) (db2Rows.size() - dupes));
     }
@@ -1082,7 +1189,7 @@ public class DatabaseMerger {
             try {
                 // Validate first
                 log.info("[Merge] Running pre-merge validation...");
-                MergePlan plan = buildPlan(conn1, conn2);
+                MergePlan plan = buildPlan(conn1, conn2, db1Url, db2Url, targetUrl, target);
                 if (!plan.canProceed()) {
                     plan.printReport();
                     throw new RuntimeException("Pre-merge validation failed. See errors above.");

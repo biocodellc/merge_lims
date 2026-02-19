@@ -54,6 +54,9 @@ public class MergePlan {
     private final List<String> errors = new ArrayList<>();
     private final List<String> warnings = new ArrayList<>();
 
+    // Permission check results
+    private final List<String> permissionResults = new ArrayList<>();
+
     // ID mapping details for plan display
     // Each entry: "DB2 id X -> Target id Y"
     private final List<String> cscocktailMappings = new ArrayList<>();
@@ -146,6 +149,7 @@ public class MergePlan {
     public void addError(String e) { errors.add(e); }
     public List<String> getWarnings() { return warnings; }
     public void addWarning(String w) { warnings.add(w); }
+    public List<String> getPermissionResults() { return permissionResults; }
 
     public List<String> getCscocktailMappings() { return cscocktailMappings; }
     public List<String> getPcrCocktailMappings() { return pcrCocktailMappings; }
@@ -207,6 +211,16 @@ public class MergePlan {
         System.out.printf("  DB1 full version:     %s%n", db1FullVersion);
         System.out.printf("  DB2 full version:     %s%n", db2FullVersion);
         System.out.printf("  Full versions match:  %s%n", fullVersionsMatch ? "YES ✓" : "NO ✗");
+
+        // Permissions
+        if (!permissionResults.isEmpty()) {
+            System.out.println();
+            System.out.println("  DATABASE PERMISSIONS");
+            System.out.println(thin);
+            for (String result : permissionResults) {
+                System.out.println("  " + result);
+            }
+        }
 
         // Properties merge
         System.out.println();
