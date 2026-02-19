@@ -498,7 +498,7 @@ public class DatabaseMerger {
         MergePlan plan = new MergePlan();
 
         // 0. Permission checks (MySQL only)
-        log.info("[Plan  1/10] Checking database permissions...");
+        log.info("[Plan  1/11] Checking database permissions...");
         checkPermissions(conn1, db1Url, "DB1", new String[]{"SELECT"}, plan);
         checkPermissions(conn2, db2Url, "DB2", new String[]{"SELECT"}, plan);
         if (targetConn != null) {
@@ -508,7 +508,7 @@ public class DatabaseMerger {
         }
 
         // 1. Version validation
-        log.info("[Plan  2/10] Validating database versions...");
+        log.info("[Plan  2/11] Validating database versions...");
         plan.setDb1Version(getDatabaseVersion(conn1));
         plan.setDb2Version(getDatabaseVersion(conn2));
         plan.setVersionsMatch(plan.getDb1Version() == plan.getDb2Version());
@@ -517,7 +517,7 @@ public class DatabaseMerger {
         }
 
         // 2. Properties
-        log.info("[Plan  3/10] Reading properties...");
+        log.info("[Plan  3/11] Reading properties...");
         plan.setDb1FullVersion(getStringProperty(conn1, "fullDatabaseVersion"));
         plan.setDb2FullVersion(getStringProperty(conn2, "fullDatabaseVersion"));
         plan.setFullVersionsMatch(Objects.equals(plan.getDb1FullVersion(), plan.getDb2FullVersion()));
@@ -531,7 +531,7 @@ public class DatabaseMerger {
         plan.setDb2BackgroundTasksFailed(getLongProperty(conn2, "numberOfTimesBackgroundTasksFailed"));
 
         // 3. Count all tables
-        log.info("[Plan  4/10] Counting records in all tables...");
+        log.info("[Plan  4/11] Counting records in all tables...");
         for (String table : MergePlan.ALL_TABLES) {
             try {
                 plan.getDb1Counts().put(table, countRows(conn1, table));
@@ -547,27 +547,31 @@ public class DatabaseMerger {
         log.info("  Counted {} tables in both databases", MergePlan.ALL_TABLES.size());
 
         // 4. Simulate cyclesequencing_cocktail deduplication
-        log.info("[Plan  5/10] Analyzing cyclesequencing_cocktail deduplication...");
+        log.info("[Plan  5/11] Analyzing cyclesequencing_cocktail deduplication...");
         simulateCsCocktailDedup(conn1, conn2, plan);
 
         // 5. Simulate pcr_cocktail deduplication
-        log.info("[Plan  6/10] Analyzing pcr_cocktail deduplication...");
+        log.info("[Plan  6/11] Analyzing pcr_cocktail deduplication...");
         simulatePcrCocktailDedup(conn1, conn2, plan);
 
         // 6. Simulate thermocycle hierarchy deduplication
-        log.info("[Plan  7/10] Analyzing thermocycle hierarchy deduplication...");
+        log.info("[Plan  7/11] Analyzing thermocycle hierarchy deduplication...");
         simulateThermocycleDedup(conn1, conn2, plan);
 
         // 7. Check extraction ID uniqueness
-        log.info("[Plan  8/10] Checking extraction ID uniqueness...");
+        log.info("[Plan  8/11] Checking extraction ID uniqueness...");
         checkExtractionIdUniqueness(conn1, conn2, plan);
 
-        // 8. Check plate name uniqueness
-        log.info("[Plan  9/10] Checking plate name uniqueness...");
+        // 8. Check extraction barcode uniqueness
+        log.info("[Plan  9/11] Checking extraction barcode uniqueness...");
+        checkExtractionBarcodeUniqueness(conn1, conn2, plan);
+
+        // 9. Check plate name uniqueness
+        log.info("[Plan 10/11] Checking plate name uniqueness...");
         checkPlateNameUniqueness(conn1, conn2, plan);
 
-        // 9. Check workflow name conflicts
-        log.info("[Plan 10/10] Checking workflow name conflicts...");
+        // 10. Check workflow name conflicts
+        log.info("[Plan 11/11] Checking workflow name conflicts...");
         checkWorkflowNameConflicts(conn1, conn2, plan);
 
         log.info("Plan analysis complete.");
@@ -985,6 +989,162 @@ public class DatabaseMerger {
         int col = location % 12;
         char rowLetter = (char) ('A' + row);
         return "" + rowLetter + (col + 1);
+    }
+
+    private void checkExtractionBarcodeUniqueness(Connection conn1, Connection conn2, MergePlan plan) throws SQLException {
+        String detailQuery =
+                "SELECT e.extractionBarcode, e.location, p.name AS plateName " +
+                "FROM extraction e JOIN plate p ON e.plate = p.id " +
+                "WHERE e.extractionBarcode IS NOT NULL AND e.extractionBarcode != ''";
+
+        // Check internal duplicates within each DB
+        List<String> db1InternalDupes = findInternalBarcodeDuplicates(conn1, detailQuery);
+        Set<String> db1DupePlates = findInternalBarcodeDupPlates(conn1);
+        List<String> db2InternalDupes = findInternalBarcodeDuplicates(conn2, detailQuery);
+        Set<String> db2DupePlates = findInternalBarcodeDupPlates(conn2);
+
+        // Build barcode -> plate/well lookup for DB1 (for cross-db reporting)
+        Map<String, List<String>> db1BarcodeDetails = new LinkedHashMap<>();
+        Map<String, Set<String>> db1BarcodePlates = new LinkedHashMap<>();
+        try (Statement stmt = conn1.createStatement();
+             ResultSet rs = stmt.executeQuery(detailQuery)) {
+            while (rs.next()) {
+                String barcode = rs.getString("extractionBarcode");
+                String plateName = rs.getString("plateName");
+                int location = rs.getInt("location");
+                db1BarcodeDetails.computeIfAbsent(barcode, k -> new ArrayList<>())
+                        .add(plateName + " / " + wellLocationToString(location));
+                db1BarcodePlates.computeIfAbsent(barcode, k -> new LinkedHashSet<>())
+                        .add(plateName);
+            }
+        }
+
+        // Check cross-database duplicates
+        List<String> crossDupes = new ArrayList<>();
+        Set<String> crossBarcodesFound = new LinkedHashSet<>();
+        Set<String> crossDupePlatesDb1 = new LinkedHashSet<>();
+        Set<String> crossDupePlatesDb2 = new LinkedHashSet<>();
+        try (Statement stmt = conn2.createStatement();
+             ResultSet rs = stmt.executeQuery(detailQuery)) {
+            while (rs.next()) {
+                String barcode = rs.getString("extractionBarcode");
+                if (db1BarcodeDetails.containsKey(barcode)) {
+                    String plateName = rs.getString("plateName");
+                    int location = rs.getInt("location");
+                    String db2Loc = plateName + " / " + wellLocationToString(location);
+                    List<String> db1Locs = db1BarcodeDetails.get(barcode);
+                    for (String db1Loc : db1Locs) {
+                        crossDupes.add(barcode + "  DB1: " + db1Loc + "  |  DB2: " + db2Loc);
+                    }
+                    crossBarcodesFound.add(barcode);
+                    crossDupePlatesDb2.add(plateName);
+                    crossDupePlatesDb1.addAll(db1BarcodePlates.getOrDefault(barcode, Collections.emptySet()));
+                }
+            }
+        }
+
+        boolean hasIssues = false;
+
+        // Store full details for file output
+        if (!db1InternalDupes.isEmpty()) {
+            plan.getDuplicateExtractionBarcodes().add("DB1 internal duplicates:");
+            for (String d : db1InternalDupes) plan.getDuplicateExtractionBarcodes().add("  " + d);
+            plan.addWarning("DB1 has " + db1InternalDupes.size() +
+                    " duplicate extractionBarcode occurrence(s) internally on plate(s): " +
+                    String.join(", ", db1DupePlates));
+            plan.getBarcodeWarningPlatesDb1().addAll(db1DupePlates);
+            hasIssues = true;
+        }
+
+        if (!db2InternalDupes.isEmpty()) {
+            plan.getDuplicateExtractionBarcodes().add("DB2 internal duplicates:");
+            for (String d : db2InternalDupes) plan.getDuplicateExtractionBarcodes().add("  " + d);
+            plan.addWarning("DB2 has " + db2InternalDupes.size() +
+                    " duplicate extractionBarcode occurrence(s) internally on plate(s): " +
+                    String.join(", ", db2DupePlates));
+            plan.getBarcodeWarningPlatesDb2().addAll(db2DupePlates);
+            hasIssues = true;
+        }
+
+        if (!crossDupes.isEmpty()) {
+            plan.getDuplicateExtractionBarcodes().add("Cross-database duplicates (" + crossBarcodesFound.size() + " barcode(s)):");
+            for (String d : crossDupes) plan.getDuplicateExtractionBarcodes().add("  " + d);
+            plan.addWarning("Duplicate extraction.extractionBarcode values between DB1 and DB2 (" +
+                    crossBarcodesFound.size() + ")");
+            plan.getBarcodeWarningPlatesDb1().addAll(crossDupePlatesDb1);
+            plan.getBarcodeWarningPlatesDb2().addAll(crossDupePlatesDb2);
+            hasIssues = true;
+        }
+
+        plan.setExtractionBarcodesUnique(!hasIssues);
+        if (hasIssues) {
+            int db1Count = db1InternalDupes.size();
+            int db2Count = db2InternalDupes.size();
+            int crossCount = crossBarcodesFound.size();
+            StringBuilder detail = new StringBuilder();
+            if (db1Count > 0) detail.append(db1Count).append(" DB1 internal, ");
+            if (db2Count > 0) detail.append(db2Count).append(" DB2 internal, ");
+            if (crossCount > 0) detail.append(crossCount).append(" cross-database, ");
+            if (detail.length() > 2) detail.setLength(detail.length() - 2);
+            detail.append(" duplicate(s)");
+            plan.setExtractionBarcodeConflictDetail(detail.toString());
+        }
+    }
+
+    /**
+     * Find extractionBarcode values that appear more than once within a single database,
+     * returning each occurrence with plate name and well location.
+     */
+    private List<String> findInternalBarcodeDuplicates(Connection conn, String detailQuery) throws SQLException {
+        // First find which barcodes are duplicated
+        Set<String> dupBarcodes = new LinkedHashSet<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT extractionBarcode FROM extraction " +
+                     "WHERE extractionBarcode IS NOT NULL AND extractionBarcode != '' " +
+                     "GROUP BY extractionBarcode HAVING COUNT(*) > 1")) {
+            while (rs.next()) {
+                dupBarcodes.add(rs.getString("extractionBarcode"));
+            }
+        }
+
+        if (dupBarcodes.isEmpty()) return Collections.emptyList();
+
+        // Then fetch plate/well details for each duplicated barcode
+        List<String> results = new ArrayList<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(detailQuery)) {
+            while (rs.next()) {
+                String barcode = rs.getString("extractionBarcode");
+                if (dupBarcodes.contains(barcode)) {
+                    String plateName = rs.getString("plateName");
+                    int location = rs.getInt("location");
+                    results.add(barcode + "  " + plateName + " / " + wellLocationToString(location));
+                }
+            }
+        }
+        return results;
+    }
+
+    /**
+     * Find plate names that contain internally-duplicated barcodes.
+     */
+    private Set<String> findInternalBarcodeDupPlates(Connection conn) throws SQLException {
+        Set<String> plates = new LinkedHashSet<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT DISTINCT p.name FROM extraction e " +
+                     "JOIN plate p ON e.plate = p.id " +
+                     "WHERE e.extractionBarcode IN (" +
+                     "  SELECT extractionBarcode FROM extraction " +
+                     "  WHERE extractionBarcode IS NOT NULL AND extractionBarcode != '' " +
+                     "  GROUP BY extractionBarcode HAVING COUNT(*) > 1" +
+                     ")")) {
+            while (rs.next()) {
+                plates.add(rs.getString("name"));
+            }
+        }
+        return plates;
     }
 
     private void checkPlateNameUniqueness(Connection conn1, Connection conn2, MergePlan plan) throws SQLException {

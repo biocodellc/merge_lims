@@ -47,6 +47,8 @@ public class MergePlan {
     // Extraction/plate uniqueness
     private boolean extractionIdsUnique = true;
     private String extractionIdConflictDetail;
+    private boolean extractionBarcodesUnique = true;
+    private String extractionBarcodeConflictDetail;
     private boolean plateNamesUnique = true;
     private String plateNameConflictDetail;
 
@@ -67,6 +69,11 @@ public class MergePlan {
 
     // Duplicate extraction IDs
     private final List<String> duplicateExtractionIds = new ArrayList<>();
+
+    // Duplicate extraction barcodes
+    private final List<String> duplicateExtractionBarcodes = new ArrayList<>();
+    private final Set<String> barcodeWarningPlatesDb1 = new LinkedHashSet<>();
+    private final Set<String> barcodeWarningPlatesDb2 = new LinkedHashSet<>();
 
     // ---- Tables in processing order ----
     public static final List<String> ALL_TABLES = Arrays.asList(
@@ -140,6 +147,10 @@ public class MergePlan {
     public void setExtractionIdsUnique(boolean v) { extractionIdsUnique = v; }
     public String getExtractionIdConflictDetail() { return extractionIdConflictDetail; }
     public void setExtractionIdConflictDetail(String v) { extractionIdConflictDetail = v; }
+    public boolean isExtractionBarcodesUnique() { return extractionBarcodesUnique; }
+    public void setExtractionBarcodesUnique(boolean v) { extractionBarcodesUnique = v; }
+    public String getExtractionBarcodeConflictDetail() { return extractionBarcodeConflictDetail; }
+    public void setExtractionBarcodeConflictDetail(String v) { extractionBarcodeConflictDetail = v; }
     public boolean isPlateNamesUnique() { return plateNamesUnique; }
     public void setPlateNamesUnique(boolean v) { plateNamesUnique = v; }
     public String getPlateNameConflictDetail() { return plateNameConflictDetail; }
@@ -157,6 +168,9 @@ public class MergePlan {
     public List<String> getCycleMappings() { return cycleMappings; }
     public List<String> getStateMappings() { return stateMappings; }
     public List<String> getDuplicateExtractionIds() { return duplicateExtractionIds; }
+    public List<String> getDuplicateExtractionBarcodes() { return duplicateExtractionBarcodes; }
+    public Set<String> getBarcodeWarningPlatesDb1() { return barcodeWarningPlatesDb1; }
+    public Set<String> getBarcodeWarningPlatesDb2() { return barcodeWarningPlatesDb2; }
 
     public boolean canProceed() {
         return errors.isEmpty();
@@ -326,7 +340,7 @@ public class MergePlan {
         System.out.println();
         System.out.println("  UNIQUENESS CHECKS");
         System.out.println(thin);
-        System.out.printf("  Extraction IDs unique: %s%n", extractionIdsUnique ? "YES ✓" : "NO ✗");
+        System.out.printf("  Extraction IDs unique:       %s%n", extractionIdsUnique ? "YES ✓" : "NO ✗");
         if (!extractionIdsUnique) {
             System.out.printf("    Detail: %s%n", extractionIdConflictDetail);
             System.out.println("    Duplicate extractions (extractionId | DB1: plate / well | DB2: plate / well):");
@@ -334,9 +348,32 @@ public class MergePlan {
                 System.out.println("      - " + eid);
             }
         }
-        System.out.printf("  Plate names unique:    %s%n", plateNamesUnique ? "YES ✓" : "NO ✗");
+        System.out.printf("  Extraction barcodes unique:  %s%n", extractionBarcodesUnique ? "YES ✓" : "NO (warning)");
+        if (!extractionBarcodesUnique) {
+            System.out.printf("    Detail: %s%n", extractionBarcodeConflictDetail);
+            if (!barcodeWarningPlatesDb1.isEmpty()) {
+                System.out.println("    DB1 affected plates: " + String.join(", ", barcodeWarningPlatesDb1));
+            }
+            if (!barcodeWarningPlatesDb2.isEmpty()) {
+                System.out.println("    DB2 affected plates: " + String.join(", ", barcodeWarningPlatesDb2));
+            }
+            // Write full details to file
+            String filename = "duplicate_barcodes.txt";
+            try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+                pw.println("Duplicate Extraction Barcode Report");
+                pw.println("===================================");
+                pw.println();
+                for (String line : duplicateExtractionBarcodes) {
+                    pw.println(line);
+                }
+            } catch (java.io.IOException e) {
+                System.err.println("    Warning: could not write " + filename + ": " + e.getMessage());
+            }
+            System.out.println("    Full details written to: " + filename);
+        }
+        System.out.printf("  Plate names unique:          %s%n", plateNamesUnique ? "YES ✓" : "NO ✗");
         if (!plateNamesUnique) System.out.printf("    Detail: %s%n", plateNameConflictDetail);
-        System.out.printf("  Workflow names ok:     %s%n", !workflowRenameConflict ? "YES ✓" : "NO ✗");
+        System.out.printf("  Workflow names ok:           %s%n", !workflowRenameConflict ? "YES ✓" : "NO ✗");
         if (workflowRenameConflict) System.out.printf("    Detail: %s%n", workflowConflictDetail);
 
         // Errors and warnings
@@ -349,14 +386,50 @@ public class MergePlan {
             }
         }
 
-        if (!errors.isEmpty()) {
-            System.out.println();
-            System.out.println("  ERRORS");
-            System.out.println(thin);
-            for (String e : errors) {
-                System.out.println("  ✗ " + e);
-            }
+        // Summary of all checks
+        System.out.println();
+        System.out.println("  CHECK SUMMARY");
+        System.out.println(thin);
+
+        // Permissions
+        boolean permissionsOk = true;
+        for (String r : permissionResults) {
+            if (r.contains("MISSING") || r.contains("UNABLE TO CHECK")) { permissionsOk = false; break; }
         }
+        System.out.printf("  %s Database permissions verified%n",
+                permissionsOk ? "✓" : "✗");
+
+        // Version
+        System.out.printf("  %s Database versions match%n",
+                versionsMatch ? "✓" : "✗");
+        System.out.printf("  %s Full database versions match%n",
+                fullVersionsMatch ? "✓" : "✗");
+
+        // Extraction IDs
+        System.out.printf("  %s No duplicate extraction.extractionId values between DB1 and DB2%n",
+                extractionIdsUnique ? "✓" : "✗");
+
+        // Extraction barcodes (warnings only — do not block merge)
+        boolean db1BarcodesOk = true, db2BarcodesOk = true, crossBarcodesOk = true;
+        for (String d : duplicateExtractionBarcodes) {
+            if (d.startsWith("DB1 internal")) db1BarcodesOk = false;
+            if (d.startsWith("DB2 internal")) db2BarcodesOk = false;
+            if (d.startsWith("Cross-database")) crossBarcodesOk = false;
+        }
+        System.out.printf("  %s No duplicate extraction.extractionBarcode values within DB1%n",
+                db1BarcodesOk ? "✓" : "⚠");
+        System.out.printf("  %s No duplicate extraction.extractionBarcode values within DB2%n",
+                db2BarcodesOk ? "✓" : "⚠");
+        System.out.printf("  %s No duplicate extraction.extractionBarcode values between DB1 and DB2%n",
+                crossBarcodesOk ? "✓" : "⚠");
+
+        // Plate names
+        System.out.printf("  %s No duplicate plate.name values between DB1 and DB2%n",
+                plateNamesUnique ? "✓" : "✗");
+
+        // Workflow names
+        System.out.printf("  %s No workflow name conflicts after applying rename offset%n",
+                !workflowRenameConflict ? "✓" : "✗");
 
         // Summary
         System.out.println();
