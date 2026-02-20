@@ -62,13 +62,21 @@ public class DatabaseMerger {
         String db2Password = null;
         String targetUsername = null;
         String targetPassword = null;
+        boolean skipSchema = false;
 
         // First arg is always the mode
         mode = args[0].toLowerCase();
 
-        // Determine properties file path: second arg if not a URL, otherwise default
+        // Scan for --skip-schema flag anywhere in args
+        for (String arg : args) {
+            if ("--skip-schema".equals(arg)) {
+                skipSchema = true;
+            }
+        }
+
+        // Determine properties file path: second arg if not a URL and not a flag, otherwise default
         String propsPath = "merger.properties";
-        if (args.length == 2 && !args[1].startsWith("jdbc:")) {
+        if (args.length >= 2 && !args[1].startsWith("jdbc:") && !args[1].startsWith("--")) {
             propsPath = args[1];
         }
 
@@ -99,6 +107,10 @@ public class DatabaseMerger {
                 if (db2Password == null) db2Password = sharedPass;
                 if (targetUsername == null) targetUsername = sharedUser;
                 if (targetPassword == null) targetPassword = sharedPass;
+
+                // Optional: skip schema creation
+                String skipSchemaProp = props.getProperty("skip.schema");
+                if ("true".equalsIgnoreCase(skipSchemaProp)) skipSchema = true;
 
                 log.info("Loaded configuration from {}", propsFile.getAbsolutePath());
             } catch (java.io.IOException e) {
@@ -143,7 +155,8 @@ public class DatabaseMerger {
                 case "merge":
                     merger.runMerge(db1Url, db1Username, db1Password,
                                    db2Url, db2Username, db2Password,
-                                   targetUrl, targetUsername, targetPassword);
+                                   targetUrl, targetUsername, targetPassword,
+                                   skipSchema);
                     break;
             }
         } catch (Exception e) {
@@ -181,6 +194,12 @@ public class DatabaseMerger {
         System.out.println("  # Or shared credentials (used when per-db not set):");
         System.out.println("  db.username=shareduser");
         System.out.println("  db.password=sharedpass");
+        System.out.println();
+        System.out.println("  # Skip schema creation (tables must already exist):");
+        System.out.println("  skip.schema=true");
+        System.out.println();
+        System.out.println("Options:");
+        System.out.println("  --skip-schema   Skip CREATE TABLE statements (tables must already exist)");
     }
 
     // ─── Connection helper ─────────────────────────────────────────────
@@ -242,6 +261,28 @@ public class DatabaseMerger {
         String autoInc = isSQLite(targetUrl) ? "INTEGER PRIMARY KEY AUTOINCREMENT" : "INTEGER PRIMARY KEY AUTO_INCREMENT";
         String timestampDefault = isSQLite(targetUrl) ? "TIMESTAMP DEFAULT CURRENT_TIMESTAMP" : "TIMESTAMP DEFAULT CURRENT_TIMESTAMP";
 
+        // For MySQL, test if we have REFERENCES privilege. If not, create tables without FK constraints.
+        boolean includeForeignKeys = true;
+        if (!isSQLite(targetUrl)) {
+            includeForeignKeys = testReferencesPrivilege(target);
+            if (!includeForeignKeys) {
+                log.warn("REFERENCES privilege not available — creating tables without FOREIGN KEY constraints");
+            }
+        }
+
+        // Helper to conditionally include FK clause
+        String fk_cycle_tc = includeForeignKeys ? ", FOREIGN KEY (thermocycleId) REFERENCES thermocycle(id)" : "";
+        String fk_state_cy = includeForeignKeys ? ", FOREIGN KEY (cycleId) REFERENCES cycle(id)" : "";
+        String fk_gelimg_pl = includeForeignKeys ? ", FOREIGN KEY (plate) REFERENCES plate(id)" : "";
+        String fk_ext_pl = includeForeignKeys ? ", FOREIGN KEY (plate) REFERENCES plate(id)" : "";
+        String fk_wf_ext = includeForeignKeys ? ", FOREIGN KEY (extractionId) REFERENCES extraction(id)" : "";
+        String fk_asm_wf = includeForeignKeys ? ", FOREIGN KEY (workflow) REFERENCES workflow(id), FOREIGN KEY (failure_reason) REFERENCES failure_reason(id)" : "";
+        String fk_gelq = includeForeignKeys ? ", FOREIGN KEY (extractionId) REFERENCES extraction(id), FOREIGN KEY (plate) REFERENCES plate(id)" : "";
+        String fk_pcr = includeForeignKeys ? ", FOREIGN KEY (workflow) REFERENCES workflow(id), FOREIGN KEY (cocktail) REFERENCES pcr_cocktail(id), FOREIGN KEY (plate) REFERENCES plate(id)" : "";
+        String fk_cs = includeForeignKeys ? ", FOREIGN KEY (plate) REFERENCES plate(id), FOREIGN KEY (workflow) REFERENCES workflow(id), FOREIGN KEY (cocktail) REFERENCES cyclesequencing_cocktail(id)" : "";
+        String fk_traces = includeForeignKeys ? ", FOREIGN KEY (reaction) REFERENCES cyclesequencing(id) ON DELETE CASCADE" : "";
+        String fk_seqres = includeForeignKeys ? ", FOREIGN KEY (reaction) REFERENCES cyclesequencing(id) ON DELETE CASCADE, FOREIGN KEY (assembly) REFERENCES assembly(id) ON DELETE CASCADE" : "";
+
         // databaseversion
         stmt.execute("CREATE TABLE IF NOT EXISTS databaseversion (version INTEGER PRIMARY KEY)");
 
@@ -273,13 +314,13 @@ public class DatabaseMerger {
 
         // cycle
         stmt.execute("CREATE TABLE IF NOT EXISTS cycle (" +
-                "id " + autoInc + ", thermocycleId INTEGER, repeats INTEGER, " +
-                "FOREIGN KEY (thermocycleId) REFERENCES thermocycle(id))");
+                "id " + autoInc + ", thermocycleId INTEGER, repeats INTEGER" +
+                fk_cycle_tc + ")");
 
         // state
         stmt.execute("CREATE TABLE IF NOT EXISTS state (" +
                 "id " + autoInc + ", temp INTEGER NOT NULL, length INTEGER NOT NULL, " +
-                "cycleId INTEGER, FOREIGN KEY (cycleId) REFERENCES cycle(id))");
+                "cycleId INTEGER" + fk_state_cy + ")");
 
         // failure_reason
         stmt.execute("CREATE TABLE IF NOT EXISTS failure_reason (" +
@@ -288,8 +329,8 @@ public class DatabaseMerger {
         // gelimages
         stmt.execute("CREATE TABLE IF NOT EXISTS gelimages (" +
                 "id " + autoInc + ", name VARCHAR(45) NOT NULL, plate INTEGER NOT NULL, " +
-                "imageData " + longBlob + ", notes " + longText + " NOT NULL, " +
-                "FOREIGN KEY (plate) REFERENCES plate(id))");
+                "imageData " + longBlob + ", notes " + longText + " NOT NULL" +
+                fk_gelimg_pl + ")");
 
         // plate
         stmt.execute("CREATE TABLE IF NOT EXISTS plate (" +
@@ -315,15 +356,15 @@ public class DatabaseMerger {
                 "plate INTEGER NOT NULL, location INTEGER NOT NULL, " +
                 "technician VARCHAR(90) NOT NULL, notes " + longText + " NOT NULL, " +
                 "extractionBarcode VARCHAR(45) NOT NULL, previousPlate VARCHAR(45) NOT NULL, " +
-                "previousWell VARCHAR(45) NOT NULL, gelimage " + longBlob + ", " +
-                "FOREIGN KEY (plate) REFERENCES plate(id))");
+                "previousWell VARCHAR(45) NOT NULL, gelimage " + longBlob +
+                fk_ext_pl + ")");
 
         // workflow
         stmt.execute("CREATE TABLE IF NOT EXISTS workflow (" +
                 "id " + autoInc + ", name VARCHAR(45) DEFAULT 'workflow', " +
                 "date DATE DEFAULT CURRENT_TIMESTAMP, extractionId INTEGER NOT NULL, " +
-                "locus VARCHAR(45) DEFAULT 'COI' NOT NULL, " +
-                "FOREIGN KEY (extractionId) REFERENCES extraction(id))");
+                "locus VARCHAR(45) DEFAULT 'COI' NOT NULL" +
+                fk_wf_ext + ")");
 
         // assembly
         stmt.execute("CREATE TABLE IF NOT EXISTS assembly (" +
@@ -337,9 +378,8 @@ public class DatabaseMerger {
                 "date " + timestampDefault + ", submitted TINYINT DEFAULT 0 NOT NULL, " +
                 "notes " + longText + ", editrecord " + longText + ", " +
                 "technician VARCHAR(255), bin VARCHAR(255), ambiguities INTEGER, " +
-                "failure_reason INTEGER, failure_notes " + longText + ", " +
-                "FOREIGN KEY (workflow) REFERENCES workflow(id), " +
-                "FOREIGN KEY (failure_reason) REFERENCES failure_reason(id))");
+                "failure_reason INTEGER, failure_notes " + longText +
+                fk_asm_wf + ")");
 
         // gel_quantification
         stmt.execute("CREATE TABLE IF NOT EXISTS gel_quantification (" +
@@ -349,9 +389,8 @@ public class DatabaseMerger {
                 "notes " + longText + ", volume DOUBLE, gelImage " + longBlob + ", " +
                 "gelBuffer VARCHAR(255), gelConc DOUBLE, stain VARCHAR(255), " +
                 "stainConc VARCHAR(255), stainMethod VARCHAR(255), " +
-                "gelLadder VARCHAR(255), threshold INTEGER, aboveThreshold INTEGER, " +
-                "FOREIGN KEY (extractionId) REFERENCES extraction(id), " +
-                "FOREIGN KEY (plate) REFERENCES plate(id))");
+                "gelLadder VARCHAR(255), threshold INTEGER, aboveThreshold INTEGER" +
+                fk_gelq + ")");
 
         // pcr
         stmt.execute("CREATE TABLE IF NOT EXISTS pcr (" +
@@ -363,10 +402,8 @@ public class DatabaseMerger {
                 "cleanupPerformed TINYINT DEFAULT 0, cleanupMethod VARCHAR(45) NOT NULL, " +
                 "technician VARCHAR(90) NOT NULL, notes " + longText + " NOT NULL, " +
                 "revPrName VARCHAR(64) NOT NULL, revPrSequence VARCHAR(999) NOT NULL, " +
-                "gelimage " + longBlob + ", " +
-                "FOREIGN KEY (workflow) REFERENCES workflow(id), " +
-                "FOREIGN KEY (cocktail) REFERENCES pcr_cocktail(id), " +
-                "FOREIGN KEY (plate) REFERENCES plate(id))");
+                "gelimage " + longBlob +
+                fk_pcr + ")");
 
         // cyclesequencing
         stmt.execute("CREATE TABLE IF NOT EXISTS cyclesequencing (" +
@@ -378,23 +415,20 @@ public class DatabaseMerger {
                 "extractionId VARCHAR(45) NOT NULL, cocktail INTEGER NOT NULL, " +
                 "progress VARCHAR(45) NOT NULL, cleanupPerformed TINYINT NOT NULL, " +
                 "cleanupMethod VARCHAR(99) NOT NULL, direction VARCHAR(32) NOT NULL, " +
-                "gelimage " + longBlob + ", " +
-                "FOREIGN KEY (plate) REFERENCES plate(id), " +
-                "FOREIGN KEY (workflow) REFERENCES workflow(id), " +
-                "FOREIGN KEY (cocktail) REFERENCES cyclesequencing_cocktail(id))");
+                "gelimage " + longBlob +
+                fk_cs + ")");
 
         // traces
         stmt.execute("CREATE TABLE IF NOT EXISTS traces (" +
                 "id " + autoInc + ", reaction INTEGER NOT NULL, " +
-                "name VARCHAR(96) NOT NULL, data " + longBlob + " NOT NULL, " +
-                "FOREIGN KEY (reaction) REFERENCES cyclesequencing(id) ON DELETE CASCADE)");
+                "name VARCHAR(96) NOT NULL, data " + longBlob + " NOT NULL" +
+                fk_traces + ")");
 
         // sequencing_result
         stmt.execute("CREATE TABLE IF NOT EXISTS sequencing_result (" +
                 "reaction INTEGER, assembly INTEGER, " +
-                "PRIMARY KEY (reaction, assembly), " +
-                "FOREIGN KEY (reaction) REFERENCES cyclesequencing(id) ON DELETE CASCADE, " +
-                "FOREIGN KEY (assembly) REFERENCES assembly(id) ON DELETE CASCADE)");
+                "PRIMARY KEY (reaction, assembly)" +
+                fk_seqres + ")");
 
         // Create indexes
         stmt.execute("CREATE INDEX IF NOT EXISTS plate_name ON plate (name)");
@@ -412,6 +446,25 @@ public class DatabaseMerger {
 
         stmt.close();
         log.info("Target schema created successfully.");
+    }
+
+    /**
+     * Test if the current user has REFERENCES privilege by attempting to create and drop
+     * a temporary table with a self-referencing foreign key.
+     */
+    private boolean testReferencesPrivilege(Connection conn) {
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE IF NOT EXISTS _merger_fk_test (id INTEGER PRIMARY KEY, ref_id INTEGER, " +
+                    "FOREIGN KEY (ref_id) REFERENCES _merger_fk_test(id))");
+            stmt.execute("DROP TABLE IF EXISTS _merger_fk_test");
+            return true;
+        } catch (SQLException e) {
+            log.debug("REFERENCES privilege test failed: {}", e.getMessage());
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("DROP TABLE IF EXISTS _merger_fk_test");
+            } catch (SQLException ignored) {}
+            return false;
+        }
     }
 
     // ─── Utility: count rows ───────────────────────────────────────────
@@ -1471,7 +1524,8 @@ public class DatabaseMerger {
 
     public void runMerge(String db1Url, String db1Username, String db1Password,
                          String db2Url, String db2Username, String db2Password,
-                         String targetUrl, String targetUsername, String targetPassword) throws Exception {
+                         String targetUrl, String targetUsername, String targetPassword,
+                         boolean skipSchema) throws Exception {
         log.info("Starting database merge...");
 
         try (Connection conn1 = connect(db1Url, db1Username, db1Password);
@@ -1508,9 +1562,13 @@ public class DatabaseMerger {
                 log.info("[Merge] Computing plate/location duplicate skip IDs...");
                 computePlateLocationSkipIds(conn1, conn2);
 
-                // Create schema
-                log.info("[Merge  1/17] Creating target schema...");
-                createTargetSchema(target, targetUrl);
+                // Create schema (or skip if tables already exist)
+                if (skipSchema) {
+                    log.info("[Merge  1/17] Skipping schema creation (--skip-schema)");
+                } else {
+                    log.info("[Merge  1/17] Creating target schema...");
+                    createTargetSchema(target, targetUrl);
+                }
 
                 // Phase 1: Version and properties
                 log.info("[Merge  2/17] Merging version and properties...");
