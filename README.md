@@ -29,12 +29,16 @@ The plan task runs 12 validation steps before reporting whether the merge can pr
 | 5–6 | **Cocktail deduplication** — Simulates CS and PCR cocktail dedup, identifying full-row duplicates and names that will be prefixed. | Info |
 | 7 | **Thermocycle deduplication** — Simulates thermocycle hierarchy dedup. | Info |
 | 8 | **Extraction ID uniqueness** — `extraction.extractionId` must be unique across both databases. Shows plate name and well location for any conflicts. | Error |
-| 9 | **Extraction barcode uniqueness** — Checks `extraction.extractionBarcode` for duplicates within each database and between them. Shows counts and affected plate names on console; writes full barcode/plate/well details to `duplicate_barcodes.txt`. | Warning |
+| 9 | **Extraction barcode uniqueness** — Checks `extraction.extractionBarcode` for duplicates within each database and between them. Shows counts and affected plate names (per database) on console; writes full barcode/plate/well details to `duplicate_barcodes.txt`. | Warning |
 | 10 | **Plate name uniqueness** — `plate.name` must be unique across both databases. | Error |
 | 11 | **Workflow name conflicts** — Simulates the workflow renaming strategy and checks for conflicts. | Error |
 | 12 | **Duplicate plate/location reactions** — Checks for multiple extraction, PCR, or cyclesequencing reactions pointing to the same plate and well location within each database. Lists every occurrence broken down by reaction type and database. During merge, only the most recent reaction (highest id) is kept. | Warning |
 
 Errors block the merge. Warnings are reported but do not prevent merging.
+
+### Check Summary
+
+The plan report ends with a CHECK SUMMARY showing ✓, ✗, or ⚠ for every check. The text reflects the actual result — for example `"No duplicate plate.name values between DB1 and DB2"` when passing, or `"Duplicate plate.name values found between DB1 and DB2"` when failing.
 
 ### Plate/Location Deduplication
 
@@ -83,6 +87,15 @@ For DB2 records, foreign keys are resolved as follows:
 
 Workflow names follow the pattern `LOCUS_workflowXX`. To avoid duplicates, DB2 workflow numbers are offset by the maximum number found in DB1 for the same locus. If conflicts remain after offsetting, the merge aborts.
 
+## MySQL Compatibility
+
+The schema creation step handles several MySQL-specific limitations automatically:
+
+- **REFERENCES privilege** — If the target database user lacks the `REFERENCES` privilege, foreign key constraints are silently omitted from `CREATE TABLE` statements. A test query is run first to detect this. Tables are still created with the correct columns and indexes.
+- **DATE defaults** — MySQL does not allow `CURRENT_TIMESTAMP` as a default for `DATE` columns. The merger uses `DATETIME DEFAULT CURRENT_TIMESTAMP` for MySQL and `DATE DEFAULT CURRENT_TIMESTAMP` for SQLite.
+- **CREATE INDEX IF NOT EXISTS** — Not supported by MySQL. The merger uses plain `CREATE INDEX` and catches duplicate-index errors silently.
+- **Skip schema creation** — If the target tables already exist (e.g. created by LabBench itself), schema creation can be skipped entirely with the `--skip-schema` flag.
+
 ## Configuration
 
 ### Properties File (recommended)
@@ -105,6 +118,12 @@ target.password=
 # Shared credentials (fallback when per-database not set):
 # db.username=shareduser
 # db.password=sharedpass
+
+# Skip schema creation (set to true if target tables already exist):
+# skip.schema=false
+
+# Test mode: copy only 10 rows per table (tier 1 and above):
+# test.mode=false
 ```
 
 Each database can have its own username and password. If per-database credentials are not set, the shared `db.username` / `db.password` values are used as a fallback. This allows read-only accounts on the source databases and a write-capable account on the target.
@@ -116,6 +135,8 @@ Each database can have its own username and password. If per-database credential
 | DB1 (source) | `SELECT` only |
 | DB2 (source) | `SELECT` only |
 | Target | `SELECT`, `INSERT`, `CREATE TABLE` |
+
+`REFERENCES` is used if available (for foreign key constraints) but is not required — the merger auto-detects and omits FK clauses if the privilege is missing.
 
 For MySQL, the plan task verifies these permissions via `SHOW GRANTS`. For SQLite, file-level access is sufficient.
 
@@ -148,6 +169,15 @@ gradle plan \
   -Pdb1=jdbc:sqlite:/path/to/db1.db \
   -Pdb2=jdbc:sqlite:/path/to/db2.db \
   -Ptarget=jdbc:sqlite:/path/to/target.db
+
+# Skip schema creation (target tables already exist)
+gradle merge -PskipSchema
+
+# Test mode (copy only 10 rows per tier 1+ table)
+gradle merge -PtestMode
+
+# Combine flags
+gradle merge -PskipSchema -PtestMode
 ```
 
 ### Fat JAR (standalone)
@@ -162,13 +192,25 @@ java -jar build/libs/db-merger-1.0.0-all.jar plan /path/to/merger.properties
 
 # Full CLI args (legacy — shared credentials only)
 java -jar build/libs/db-merger-1.0.0-all.jar plan <db1-url> <db2-url> <target-url> [username] [password]
+
+# With flags
+java -jar build/libs/db-merger-1.0.0-all.jar merge --skip-schema
+java -jar build/libs/db-merger-1.0.0-all.jar merge --test
+java -jar build/libs/db-merger-1.0.0-all.jar merge --skip-schema --test
 ```
+
+### Command-Line Flags
+
+| Flag | Properties Equivalent | Description |
+|------|----------------------|-------------|
+| `--skip-schema` | `skip.schema=true` | Skip `CREATE TABLE` statements. Use when target tables already exist. |
+| `--test` | `test.mode=true` | Copy only 10 rows per table for tier 1 and above. Setup and dedup tables are copied in full to preserve FK integrity. |
 
 ## Progress Logging
 
 Plan mode logs progress as `[Plan  1/12]` through `[Plan 12/12]`.
 
-Merge mode logs as `[Merge  1/17]` through `[Merge 17/17]` for each table. During streaming copy, a progress message is logged every 1,000 rows.
+Merge mode logs as `[Merge  1/17]` through `[Merge 17/17]` for each table. During streaming copy, a progress message is logged every 1,000 rows. In test mode, a banner is printed at startup indicating the row limit.
 
 ## Performance Notes
 
@@ -182,7 +224,8 @@ Merge mode logs as `[Merge  1/17]` through `[Merge 17/17]` for each table. Durin
 |-----------|----------|
 | Version mismatch | Abort with error message |
 | `fullDatabaseVersion` mismatch | Abort with error message |
-| Missing MySQL permissions | Abort with error message |
+| Missing MySQL permissions (SELECT/INSERT/CREATE) | Abort with error message |
+| Missing MySQL REFERENCES privilege | Schema created without FK constraints (warning logged) |
 | Duplicate `extraction.extractionId` between DBs | Abort with error message |
 | Duplicate `plate.name` between DBs | Abort with error message |
 | Workflow name conflict after rename | Abort with error message |

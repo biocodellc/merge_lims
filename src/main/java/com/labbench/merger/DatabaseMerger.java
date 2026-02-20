@@ -44,6 +44,19 @@ public class DatabaseMerger {
     private final Set<Integer> pcrSkipIds = new HashSet<>();
     private final Set<Integer> csSkipIds = new HashSet<>();
 
+    // Test mode: limit rows copied per table (0 = no limit)
+    private int testRowLimit = 0;
+
+    /**
+     * Append LIMIT clause to a SELECT query when in test mode.
+     */
+    private String limitSql(String sql) {
+        if (testRowLimit > 0) {
+            return sql + " LIMIT " + testRowLimit;
+        }
+        return sql;
+    }
+
     // ─── Main entry point ──────────────────────────────────────────────
 
     public static void main(String[] args) {
@@ -63,14 +76,18 @@ public class DatabaseMerger {
         String targetUsername = null;
         String targetPassword = null;
         boolean skipSchema = false;
+        boolean testMode = false;
 
         // First arg is always the mode
         mode = args[0].toLowerCase();
 
-        // Scan for --skip-schema flag anywhere in args
+        // Scan for flags anywhere in args
         for (String arg : args) {
             if ("--skip-schema".equals(arg)) {
                 skipSchema = true;
+            }
+            if ("--test".equals(arg)) {
+                testMode = true;
             }
         }
 
@@ -111,6 +128,10 @@ public class DatabaseMerger {
                 // Optional: skip schema creation
                 String skipSchemaProp = props.getProperty("skip.schema");
                 if ("true".equalsIgnoreCase(skipSchemaProp)) skipSchema = true;
+
+                // Optional: test mode (limit rows)
+                String testModeProp = props.getProperty("test.mode");
+                if ("true".equalsIgnoreCase(testModeProp)) testMode = true;
 
                 log.info("Loaded configuration from {}", propsFile.getAbsolutePath());
             } catch (java.io.IOException e) {
@@ -156,7 +177,7 @@ public class DatabaseMerger {
                     merger.runMerge(db1Url, db1Username, db1Password,
                                    db2Url, db2Username, db2Password,
                                    targetUrl, targetUsername, targetPassword,
-                                   skipSchema);
+                                   skipSchema, testMode);
                     break;
             }
         } catch (Exception e) {
@@ -200,6 +221,7 @@ public class DatabaseMerger {
         System.out.println();
         System.out.println("Options:");
         System.out.println("  --skip-schema   Skip CREATE TABLE statements (tables must already exist)");
+        System.out.println("  --test          Test mode: copy only 10 rows per table (tier 1 and above)");
     }
 
     // ─── Connection helper ─────────────────────────────────────────────
@@ -1536,7 +1558,11 @@ public class DatabaseMerger {
     public void runMerge(String db1Url, String db1Username, String db1Password,
                          String db2Url, String db2Username, String db2Password,
                          String targetUrl, String targetUsername, String targetPassword,
-                         boolean skipSchema) throws Exception {
+                         boolean skipSchema, boolean testMode) throws Exception {
+        if (testMode) {
+            testRowLimit = 10;
+            log.info("*** TEST MODE: limiting to {} rows per table (tier 1+) ***", testRowLimit);
+        }
         log.info("Starting database merge...");
 
         try (Connection conn1 = connect(db1Url, db1Username, db1Password);
@@ -2164,14 +2190,14 @@ public class DatabaseMerger {
         String[] colNames = cols.split(",\\s*");
 
         // Stream DB1
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM " + tableName + " ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put(tableName, db1Count);
         log.info("  Copied {} rows from DB1", db1Count);
 
         // Stream DB2 with offset and FK mapping
         final long offset = db1Count;
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM " + tableName + " ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     int origId = ((Number) row.get("id")).intValue();
                     row.put("id", (int) (origId + offset));
@@ -2197,12 +2223,12 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO gelimages (id, name, plate, imageData, notes) VALUES (?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM gelimages ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM gelimages ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put("gelimages", db1Count);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM gelimages ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM gelimages ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "plate", plateOffset);
@@ -2218,11 +2244,11 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO plate (id, name, date, size, type, thermocycle) VALUES (?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM plate ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put("plate", db1Count);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM plate ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     Object tcVal = row.get("thermocycle");
@@ -2249,12 +2275,12 @@ public class DatabaseMerger {
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopyWithSkip(conn1, "SELECT " + cols + " FROM extraction ORDER BY id",
+        long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM extraction ORDER BY id"),
                 target, insertSql, colNames, null, extractionSkipIds);
         db1Counts.put("extraction", db1Count);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopyWithSkip(conn2, "SELECT " + cols + " FROM extraction ORDER BY id",
+        long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM extraction ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "plate", plateOffset);
@@ -2273,12 +2299,12 @@ public class DatabaseMerger {
         // Get DB1 max workflow number per locus for name offsetting
         Map<String, Integer> db1MaxPerLocus = getWorkflowMaxPerLocus(conn1);
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM workflow ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM workflow ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put("workflow", db1Count);
         final long extractionOffset = db1Counts.getOrDefault("extraction", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM workflow ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM workflow ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     int origId = ((Number) row.get("id")).intValue();
                     row.put("id", (int) (origId + db1Count));
@@ -2312,13 +2338,13 @@ public class DatabaseMerger {
                 "threshold, aboveThreshold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM gel_quantification ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM gel_quantification ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put("gel_quantification", db1Count);
         final long extractionOffset = db1Counts.getOrDefault("extraction", 0L);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM gel_quantification ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM gel_quantification ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "extractionid", extractionOffset);
@@ -2339,13 +2365,13 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO assembly (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM assembly ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM assembly ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put("assembly", db1Count);
         final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
         final long frOffset = db1Counts.getOrDefault("failure_reason", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM assembly ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM assembly ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "workflow", workflowOffset);
@@ -2368,13 +2394,13 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO pcr (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopyWithSkip(conn1, "SELECT " + cols + " FROM pcr ORDER BY id",
+        long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM pcr ORDER BY id"),
                 target, insertSql, colNames, null, pcrSkipIds);
         db1Counts.put("pcr", db1Count);
         final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopyWithSkip(conn2, "SELECT " + cols + " FROM pcr ORDER BY id",
+        long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM pcr ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "workflow", workflowOffset);
@@ -2402,13 +2428,13 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO cyclesequencing (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopyWithSkip(conn1, "SELECT " + cols + " FROM cyclesequencing ORDER BY id",
+        long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM cyclesequencing ORDER BY id"),
                 target, insertSql, colNames, null, csSkipIds);
         db1Counts.put("cyclesequencing", db1Count);
         final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopyWithSkip(conn2, "SELECT " + cols + " FROM cyclesequencing ORDER BY id",
+        long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM cyclesequencing ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "workflow", workflowOffset);
@@ -2433,12 +2459,12 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO traces (id, reaction, name, data) VALUES (?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM traces ORDER BY id",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM traces ORDER BY id"),
                 target, insertSql, colNames, null);
         db1Counts.put("traces", db1Count);
         final long csOffset = db1Counts.getOrDefault("cyclesequencing", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM traces ORDER BY id",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM traces ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "reaction", csOffset);
@@ -2454,13 +2480,13 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO sequencing_result (reaction, assembly) VALUES (?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM sequencing_result",
+        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM sequencing_result"),
                 target, insertSql, colNames, null);
         db1Counts.put("sequencing_result", db1Count);
         final long csOffset = db1Counts.getOrDefault("cyclesequencing", 0L);
         final long assemblyOffset = db1Counts.getOrDefault("assembly", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM sequencing_result",
+        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM sequencing_result"),
                 target, insertSql, colNames, row -> {
                     applyOffset(row, "reaction", csOffset);
                     applyOffset(row, "assembly", assemblyOffset);
