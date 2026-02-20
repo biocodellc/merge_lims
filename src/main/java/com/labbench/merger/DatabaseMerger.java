@@ -431,19 +431,29 @@ public class DatabaseMerger {
                 "PRIMARY KEY (reaction, assembly)" +
                 fk_seqres + ")");
 
-        // Create indexes
-        stmt.execute("CREATE INDEX IF NOT EXISTS plate_name ON plate (name)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS workflow_date ON workflow (date)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS workflow_locus ON workflow (locus)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS plate_type ON plate (type)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS plate_date ON plate (date)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS extraction_extractionBarcode ON extraction (extractionBarcode)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS extraction_date ON extraction (date)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS assembly_progress ON assembly (progress)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS assembly_submitted ON assembly (submitted)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS assembly_technician ON assembly (technician)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS assembly_date ON assembly (date)");
-        stmt.execute("CREATE INDEX IF NOT EXISTS extraction_sampleId ON extraction (sampleId)");
+        // Create indexes — MySQL doesn't support IF NOT EXISTS on CREATE INDEX
+        String[] indexes = {
+                "CREATE INDEX plate_name ON plate (name)",
+                "CREATE INDEX workflow_date ON workflow (date)",
+                "CREATE INDEX workflow_locus ON workflow (locus)",
+                "CREATE INDEX plate_type ON plate (type)",
+                "CREATE INDEX plate_date ON plate (date)",
+                "CREATE INDEX extraction_extractionBarcode ON extraction (extractionBarcode)",
+                "CREATE INDEX extraction_date ON extraction (date)",
+                "CREATE INDEX assembly_progress ON assembly (progress)",
+                "CREATE INDEX assembly_submitted ON assembly (submitted)",
+                "CREATE INDEX assembly_technician ON assembly (technician)",
+                "CREATE INDEX assembly_date ON assembly (date)",
+                "CREATE INDEX extraction_sampleId ON extraction (sampleId)"
+        };
+        for (String idx : indexes) {
+            try {
+                stmt.execute(isSQLite(targetUrl) ? idx.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ") : idx);
+            } catch (SQLException e) {
+                // Index may already exist — ignore
+                log.debug("Index creation skipped (may already exist): {}", e.getMessage());
+            }
+        }
 
         stmt.close();
         log.info("Target schema created successfully.");
