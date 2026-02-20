@@ -75,6 +75,17 @@ public class MergePlan {
     private final Set<String> barcodeWarningPlatesDb1 = new LinkedHashSet<>();
     private final Set<String> barcodeWarningPlatesDb2 = new LinkedHashSet<>();
 
+    // Duplicate plate/location reactions (per table, per database)
+    private final List<String> dupPlateLocExtraction = new ArrayList<>();
+    private final List<String> dupPlateLocPcr = new ArrayList<>();
+    private final List<String> dupPlateLocCs = new ArrayList<>();
+    private int dupPlateLocExtractionCountDb1;
+    private int dupPlateLocExtractionCountDb2;
+    private int dupPlateLocPcrCountDb1;
+    private int dupPlateLocPcrCountDb2;
+    private int dupPlateLocCsCountDb1;
+    private int dupPlateLocCsCountDb2;
+
     // ---- Tables in processing order ----
     public static final List<String> ALL_TABLES = Arrays.asList(
             "databaseversion", "properties",
@@ -171,6 +182,22 @@ public class MergePlan {
     public List<String> getDuplicateExtractionBarcodes() { return duplicateExtractionBarcodes; }
     public Set<String> getBarcodeWarningPlatesDb1() { return barcodeWarningPlatesDb1; }
     public Set<String> getBarcodeWarningPlatesDb2() { return barcodeWarningPlatesDb2; }
+
+    public List<String> getDupPlateLocExtraction() { return dupPlateLocExtraction; }
+    public List<String> getDupPlateLocPcr() { return dupPlateLocPcr; }
+    public List<String> getDupPlateLocCs() { return dupPlateLocCs; }
+    public int getDupPlateLocExtractionCountDb1() { return dupPlateLocExtractionCountDb1; }
+    public void setDupPlateLocExtractionCountDb1(int v) { dupPlateLocExtractionCountDb1 = v; }
+    public int getDupPlateLocExtractionCountDb2() { return dupPlateLocExtractionCountDb2; }
+    public void setDupPlateLocExtractionCountDb2(int v) { dupPlateLocExtractionCountDb2 = v; }
+    public int getDupPlateLocPcrCountDb1() { return dupPlateLocPcrCountDb1; }
+    public void setDupPlateLocPcrCountDb1(int v) { dupPlateLocPcrCountDb1 = v; }
+    public int getDupPlateLocPcrCountDb2() { return dupPlateLocPcrCountDb2; }
+    public void setDupPlateLocPcrCountDb2(int v) { dupPlateLocPcrCountDb2 = v; }
+    public int getDupPlateLocCsCountDb1() { return dupPlateLocCsCountDb1; }
+    public void setDupPlateLocCsCountDb1(int v) { dupPlateLocCsCountDb1 = v; }
+    public int getDupPlateLocCsCountDb2() { return dupPlateLocCsCountDb2; }
+    public void setDupPlateLocCsCountDb2(int v) { dupPlateLocCsCountDb2 = v; }
 
     public boolean canProceed() {
         return errors.isEmpty();
@@ -376,6 +403,35 @@ public class MergePlan {
         System.out.printf("  Workflow names ok:           %s%n", !workflowRenameConflict ? "YES ✓" : "NO ✗");
         if (workflowRenameConflict) System.out.printf("    Detail: %s%n", workflowConflictDetail);
 
+        // Duplicate plate/location reactions
+        int totalDupPlateLoc = dupPlateLocExtractionCountDb1 + dupPlateLocExtractionCountDb2 +
+                dupPlateLocPcrCountDb1 + dupPlateLocPcrCountDb2 +
+                dupPlateLocCsCountDb1 + dupPlateLocCsCountDb2;
+        if (totalDupPlateLoc > 0) {
+            System.out.println();
+            System.out.println("  DUPLICATE PLATE/LOCATION REACTIONS (will keep most recent only)");
+            System.out.println(thin);
+
+            if (dupPlateLocExtractionCountDb1 + dupPlateLocExtractionCountDb2 > 0) {
+                System.out.printf("  extraction: %d to skip (DB1: %d, DB2: %d)%n",
+                        dupPlateLocExtractionCountDb1 + dupPlateLocExtractionCountDb2,
+                        dupPlateLocExtractionCountDb1, dupPlateLocExtractionCountDb2);
+                for (String d : dupPlateLocExtraction) System.out.println("    " + d);
+            }
+            if (dupPlateLocPcrCountDb1 + dupPlateLocPcrCountDb2 > 0) {
+                System.out.printf("  pcr: %d to skip (DB1: %d, DB2: %d)%n",
+                        dupPlateLocPcrCountDb1 + dupPlateLocPcrCountDb2,
+                        dupPlateLocPcrCountDb1, dupPlateLocPcrCountDb2);
+                for (String d : dupPlateLocPcr) System.out.println("    " + d);
+            }
+            if (dupPlateLocCsCountDb1 + dupPlateLocCsCountDb2 > 0) {
+                System.out.printf("  cyclesequencing: %d to skip (DB1: %d, DB2: %d)%n",
+                        dupPlateLocCsCountDb1 + dupPlateLocCsCountDb2,
+                        dupPlateLocCsCountDb1, dupPlateLocCsCountDb2);
+                for (String d : dupPlateLocCs) System.out.println("    " + d);
+            }
+        }
+
         // Errors and warnings
         if (!warnings.isEmpty()) {
             System.out.println();
@@ -430,6 +486,13 @@ public class MergePlan {
         // Workflow names
         System.out.printf("  %s No workflow name conflicts after applying rename offset%n",
                 !workflowRenameConflict ? "✓" : "✗");
+
+        // Plate/location duplicates (warning only — deduped during merge)
+        int totalDupPlateLocCount = dupPlateLocExtractionCountDb1 + dupPlateLocExtractionCountDb2 +
+                dupPlateLocPcrCountDb1 + dupPlateLocPcrCountDb2 +
+                dupPlateLocCsCountDb1 + dupPlateLocCsCountDb2;
+        System.out.printf("  %s No duplicate plate/location reactions (extraction, pcr, cyclesequencing)%n",
+                totalDupPlateLocCount == 0 ? "✓" : "⚠");
 
         // Summary
         System.out.println();

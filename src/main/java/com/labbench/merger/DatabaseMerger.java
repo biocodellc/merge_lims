@@ -39,6 +39,11 @@ public class DatabaseMerger {
     // Workflow name remapping for DB2: db2 workflow id -> new name
     private final Map<Integer, String> workflowNameMap = new HashMap<>();
 
+    // IDs to skip during merge (plate/location dedup — keep highest id only)
+    private final Set<Integer> extractionSkipIds = new HashSet<>();
+    private final Set<Integer> pcrSkipIds = new HashSet<>();
+    private final Set<Integer> csSkipIds = new HashSet<>();
+
     // ─── Main entry point ──────────────────────────────────────────────
 
     public static void main(String[] args) {
@@ -498,7 +503,7 @@ public class DatabaseMerger {
         MergePlan plan = new MergePlan();
 
         // 0. Permission checks (MySQL only)
-        log.info("[Plan  1/11] Checking database permissions...");
+        log.info("[Plan  1/12] Checking database permissions...");
         checkPermissions(conn1, db1Url, "DB1", new String[]{"SELECT"}, plan);
         checkPermissions(conn2, db2Url, "DB2", new String[]{"SELECT"}, plan);
         if (targetConn != null) {
@@ -508,7 +513,7 @@ public class DatabaseMerger {
         }
 
         // 1. Version validation
-        log.info("[Plan  2/11] Validating database versions...");
+        log.info("[Plan  2/12] Validating database versions...");
         plan.setDb1Version(getDatabaseVersion(conn1));
         plan.setDb2Version(getDatabaseVersion(conn2));
         plan.setVersionsMatch(plan.getDb1Version() == plan.getDb2Version());
@@ -517,7 +522,7 @@ public class DatabaseMerger {
         }
 
         // 2. Properties
-        log.info("[Plan  3/11] Reading properties...");
+        log.info("[Plan  3/12] Reading properties...");
         plan.setDb1FullVersion(getStringProperty(conn1, "fullDatabaseVersion"));
         plan.setDb2FullVersion(getStringProperty(conn2, "fullDatabaseVersion"));
         plan.setFullVersionsMatch(Objects.equals(plan.getDb1FullVersion(), plan.getDb2FullVersion()));
@@ -531,7 +536,7 @@ public class DatabaseMerger {
         plan.setDb2BackgroundTasksFailed(getLongProperty(conn2, "numberOfTimesBackgroundTasksFailed"));
 
         // 3. Count all tables
-        log.info("[Plan  4/11] Counting records in all tables...");
+        log.info("[Plan  4/12] Counting records in all tables...");
         for (String table : MergePlan.ALL_TABLES) {
             try {
                 plan.getDb1Counts().put(table, countRows(conn1, table));
@@ -547,32 +552,36 @@ public class DatabaseMerger {
         log.info("  Counted {} tables in both databases", MergePlan.ALL_TABLES.size());
 
         // 4. Simulate cyclesequencing_cocktail deduplication
-        log.info("[Plan  5/11] Analyzing cyclesequencing_cocktail deduplication...");
+        log.info("[Plan  5/12] Analyzing cyclesequencing_cocktail deduplication...");
         simulateCsCocktailDedup(conn1, conn2, plan);
 
         // 5. Simulate pcr_cocktail deduplication
-        log.info("[Plan  6/11] Analyzing pcr_cocktail deduplication...");
+        log.info("[Plan  6/12] Analyzing pcr_cocktail deduplication...");
         simulatePcrCocktailDedup(conn1, conn2, plan);
 
         // 6. Simulate thermocycle hierarchy deduplication
-        log.info("[Plan  7/11] Analyzing thermocycle hierarchy deduplication...");
+        log.info("[Plan  7/12] Analyzing thermocycle hierarchy deduplication...");
         simulateThermocycleDedup(conn1, conn2, plan);
 
         // 7. Check extraction ID uniqueness
-        log.info("[Plan  8/11] Checking extraction ID uniqueness...");
+        log.info("[Plan  8/12] Checking extraction ID uniqueness...");
         checkExtractionIdUniqueness(conn1, conn2, plan);
 
         // 8. Check extraction barcode uniqueness
-        log.info("[Plan  9/11] Checking extraction barcode uniqueness...");
+        log.info("[Plan  9/12] Checking extraction barcode uniqueness...");
         checkExtractionBarcodeUniqueness(conn1, conn2, plan);
 
         // 9. Check plate name uniqueness
-        log.info("[Plan 10/11] Checking plate name uniqueness...");
+        log.info("[Plan 10/12] Checking plate name uniqueness...");
         checkPlateNameUniqueness(conn1, conn2, plan);
 
         // 10. Check workflow name conflicts
-        log.info("[Plan 11/11] Checking workflow name conflicts...");
+        log.info("[Plan 11/12] Checking workflow name conflicts...");
         checkWorkflowNameConflicts(conn1, conn2, plan);
+
+        // 11. Check duplicate plate/location reactions
+        log.info("[Plan 12/12] Checking for duplicate plate/location reactions...");
+        checkDuplicatePlateLocation(conn1, conn2, plan);
 
         log.info("Plan analysis complete.");
 
@@ -1232,6 +1241,88 @@ public class DatabaseMerger {
         return maxPerLocus;
     }
 
+    /**
+     * Check for reactions (extraction, pcr, cyclesequencing) that share the same plate+location.
+     * These will be deduplicated during merge by keeping only the highest id (most recent).
+     */
+    private void checkDuplicatePlateLocation(Connection conn1, Connection conn2, MergePlan plan) throws SQLException {
+        // extraction
+        int extDb1 = findDupPlateLocForTable(conn1, "extraction", "DB1", plan.getDupPlateLocExtraction());
+        int extDb2 = findDupPlateLocForTable(conn2, "extraction", "DB2", plan.getDupPlateLocExtraction());
+        plan.setDupPlateLocExtractionCountDb1(extDb1);
+        plan.setDupPlateLocExtractionCountDb2(extDb2);
+
+        // pcr
+        int pcrDb1 = findDupPlateLocForTable(conn1, "pcr", "DB1", plan.getDupPlateLocPcr());
+        int pcrDb2 = findDupPlateLocForTable(conn2, "pcr", "DB2", plan.getDupPlateLocPcr());
+        plan.setDupPlateLocPcrCountDb1(pcrDb1);
+        plan.setDupPlateLocPcrCountDb2(pcrDb2);
+
+        // cyclesequencing
+        int csDb1 = findDupPlateLocForTable(conn1, "cyclesequencing", "DB1", plan.getDupPlateLocCs());
+        int csDb2 = findDupPlateLocForTable(conn2, "cyclesequencing", "DB2", plan.getDupPlateLocCs());
+        plan.setDupPlateLocCsCountDb1(csDb1);
+        plan.setDupPlateLocCsCountDb2(csDb2);
+
+        int total = extDb1 + extDb2 + pcrDb1 + pcrDb2 + csDb1 + csDb2;
+        if (total > 0) {
+            plan.addWarning(total + " reaction(s) share a plate/location with another reaction " +
+                    "of the same type — only the most recent (highest id) will be kept during merge");
+        }
+    }
+
+    /**
+     * Find rows in the given table that share (plate, location) with another row.
+     * Returns count of rows that would be skipped (all but highest id per group).
+     * Adds detail lines to the output list.
+     */
+    private int findDupPlateLocForTable(Connection conn, String tableName, String dbLabel,
+                                        List<String> output) throws SQLException {
+        // Find (plate, location) groups with >1 row, and all their ids
+        String sql = "SELECT t.id, t.plate, t.location, p.name AS plateName " +
+                "FROM " + tableName + " t JOIN plate p ON t.plate = p.id " +
+                "WHERE (t.plate, t.location) IN (" +
+                "  SELECT plate, location FROM " + tableName +
+                "  GROUP BY plate, location HAVING COUNT(*) > 1" +
+                ") ORDER BY t.plate, t.location, t.id";
+
+        // Group by (plate, location), track all ids per group
+        Map<String, List<Integer>> groupIds = new LinkedHashMap<>();
+        Map<String, String> groupPlateNames = new LinkedHashMap<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                int id = rs.getInt("id");
+                int plate = rs.getInt("plate");
+                int location = rs.getInt("location");
+                String plateName = rs.getString("plateName");
+                String key = plate + ":" + location;
+                groupIds.computeIfAbsent(key, k -> new ArrayList<>()).add(id);
+                groupPlateNames.put(key, plateName);
+            }
+        }
+
+        if (groupIds.isEmpty()) return 0;
+
+        int skipCount = 0;
+        for (Map.Entry<String, List<Integer>> entry : groupIds.entrySet()) {
+            List<Integer> ids = entry.getValue();
+            String plateName = groupPlateNames.get(entry.getKey());
+            int location = Integer.parseInt(entry.getKey().split(":")[1]);
+            String well = wellLocationToString(location);
+            int keepId = ids.stream().max(Integer::compare).orElse(0);
+            List<Integer> skipIds = new ArrayList<>();
+            for (int id : ids) {
+                if (id != keepId) skipIds.add(id);
+            }
+            skipCount += skipIds.size();
+            output.add(dbLabel + " " + tableName + ": " + plateName + " / " + well +
+                    " — ids " + ids + ", keeping id=" + keepId +
+                    ", skipping " + skipIds.size());
+        }
+        return skipCount;
+    }
+
     // ─── Generic row fetching/comparison helpers ───────────────────────
 
     private List<Map<String, Object>> fetchAllRows(Connection conn, String sql) throws SQLException {
@@ -1308,6 +1399,55 @@ public class DatabaseMerger {
         return count;
     }
 
+    /**
+     * Like streamingCopy, but skips rows whose original (pre-transform) id is in the skipIds set.
+     * Returns the number of rows actually copied.
+     */
+    private long streamingCopyWithSkip(Connection source, String selectSql,
+                                       Connection target, String insertSql, String[] colNames,
+                                       RowTransformer transformer, Set<Integer> skipIds) throws SQLException {
+        if (skipIds.isEmpty()) {
+            return streamingCopy(source, selectSql, target, insertSql, colNames, transformer);
+        }
+        long count = 0;
+        long skipped = 0;
+        try (Statement stmt = source.createStatement();
+             ResultSet rs = stmt.executeQuery(selectSql);
+             PreparedStatement ps = target.prepareStatement(insertSql)) {
+            ResultSetMetaData meta = rs.getMetaData();
+            int batchCount = 0;
+            while (rs.next()) {
+                Map<String, Object> row = readRow(rs, meta);
+                int origId = ((Number) row.get("id")).intValue();
+                if (skipIds.contains(origId)) {
+                    skipped++;
+                    continue;
+                }
+                if (transformer != null) {
+                    transformer.transform(row);
+                }
+                setRowParams(ps, row, colNames);
+                ps.addBatch();
+                batchCount++;
+                count++;
+                if (batchCount >= BATCH_SIZE) {
+                    ps.executeBatch();
+                    batchCount = 0;
+                    if (count % (BATCH_SIZE * 10) == 0) {
+                        log.info("    ... {} rows processed", count);
+                    }
+                }
+            }
+            if (batchCount > 0) {
+                ps.executeBatch();
+            }
+        }
+        if (skipped > 0) {
+            log.info("    Skipped {} duplicate plate/location rows", skipped);
+        }
+        return count;
+    }
+
     private boolean rowsEqual(Map<String, Object> r1, Map<String, Object> r2) {
         if (r1.size() != r2.size()) return false;
         for (String key : r1.keySet()) {
@@ -1363,6 +1503,10 @@ public class DatabaseMerger {
                 // Compute duplicate cocktail name sets for name prefixing during merge
                 log.info("[Merge] Computing cocktail duplicate names...");
                 computeCocktailDupNames(conn1, conn2);
+
+                // Compute plate/location duplicate skip sets
+                log.info("[Merge] Computing plate/location duplicate skip IDs...");
+                computePlateLocationSkipIds(conn1, conn2);
 
                 // Create schema
                 log.info("[Merge  1/17] Creating target schema...");
@@ -1471,6 +1615,53 @@ public class DatabaseMerger {
         }
         if (!pcrCocktailDupNames.isEmpty()) {
             log.info("PCR cocktail duplicate names (will be prefixed): {}", pcrCocktailDupNames);
+        }
+    }
+
+    /**
+     * For each reaction table (extraction, pcr, cyclesequencing), find rows in each source DB
+     * where multiple rows share the same (plate, location). Keep only the highest id (most recent).
+     * Populate the skip ID sets used during merge.
+     */
+    private void computePlateLocationSkipIds(Connection conn1, Connection conn2) throws SQLException {
+        computeSkipIdsForTable(conn1, "extraction", extractionSkipIds, "DB1");
+        computeSkipIdsForTable(conn2, "extraction", extractionSkipIds, "DB2");
+        computeSkipIdsForTable(conn1, "pcr", pcrSkipIds, "DB1");
+        computeSkipIdsForTable(conn2, "pcr", pcrSkipIds, "DB2");
+        computeSkipIdsForTable(conn1, "cyclesequencing", csSkipIds, "DB1");
+        computeSkipIdsForTable(conn2, "cyclesequencing", csSkipIds, "DB2");
+
+        int total = extractionSkipIds.size() + pcrSkipIds.size() + csSkipIds.size();
+        if (total > 0) {
+            log.info("Plate/location dedup: skipping {} extraction, {} pcr, {} cyclesequencing rows",
+                    extractionSkipIds.size(), pcrSkipIds.size(), csSkipIds.size());
+        }
+    }
+
+    private void computeSkipIdsForTable(Connection conn, String tableName,
+                                         Set<Integer> skipIds, String dbLabel) throws SQLException {
+        String sql = "SELECT id, plate, location FROM " + tableName +
+                " WHERE (plate, location) IN (" +
+                "  SELECT plate, location FROM " + tableName +
+                "  GROUP BY plate, location HAVING COUNT(*) > 1" +
+                ") ORDER BY plate, location, id";
+
+        Map<String, List<Integer>> groupIds = new LinkedHashMap<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                int id = rs.getInt("id");
+                int plate = rs.getInt("plate");
+                int location = rs.getInt("location");
+                groupIds.computeIfAbsent(plate + ":" + location, k -> new ArrayList<>()).add(id);
+            }
+        }
+
+        for (List<Integer> ids : groupIds.values()) {
+            int keepId = ids.stream().max(Integer::compare).orElse(0);
+            for (int id : ids) {
+                if (id != keepId) skipIds.add(id);
+            }
         }
     }
 
@@ -1989,16 +2180,16 @@ public class DatabaseMerger {
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM extraction ORDER BY id",
-                target, insertSql, colNames, null);
+        long db1Count = streamingCopyWithSkip(conn1, "SELECT " + cols + " FROM extraction ORDER BY id",
+                target, insertSql, colNames, null, extractionSkipIds);
         db1Counts.put("extraction", db1Count);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM extraction ORDER BY id",
+        long db2Count = streamingCopyWithSkip(conn2, "SELECT " + cols + " FROM extraction ORDER BY id",
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "plate", plateOffset);
-                });
+                }, extractionSkipIds);
 
         log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }
@@ -2108,13 +2299,13 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO pcr (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM pcr ORDER BY id",
-                target, insertSql, colNames, null);
+        long db1Count = streamingCopyWithSkip(conn1, "SELECT " + cols + " FROM pcr ORDER BY id",
+                target, insertSql, colNames, null, pcrSkipIds);
         db1Counts.put("pcr", db1Count);
         final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM pcr ORDER BY id",
+        long db2Count = streamingCopyWithSkip(conn2, "SELECT " + cols + " FROM pcr ORDER BY id",
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "workflow", workflowOffset);
@@ -2127,7 +2318,7 @@ public class DatabaseMerger {
                             row.put("thermocycle", thermocycleMap.get(tcId));
                         }
                     }
-                });
+                }, pcrSkipIds);
 
         log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }
@@ -2142,13 +2333,13 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO cyclesequencing (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, "SELECT " + cols + " FROM cyclesequencing ORDER BY id",
-                target, insertSql, colNames, null);
+        long db1Count = streamingCopyWithSkip(conn1, "SELECT " + cols + " FROM cyclesequencing ORDER BY id",
+                target, insertSql, colNames, null, csSkipIds);
         db1Counts.put("cyclesequencing", db1Count);
         final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
         final long plateOffset = db1Counts.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, "SELECT " + cols + " FROM cyclesequencing ORDER BY id",
+        long db2Count = streamingCopyWithSkip(conn2, "SELECT " + cols + " FROM cyclesequencing ORDER BY id",
                 target, insertSql, colNames, row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
                     applyOffset(row, "workflow", workflowOffset);
@@ -2161,7 +2352,7 @@ public class DatabaseMerger {
                             row.put("thermocycle", thermocycleMap.get(tcId));
                         }
                     }
-                });
+                }, csSkipIds);
 
         log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }

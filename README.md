@@ -8,11 +8,47 @@ The merger operates in four phases:
 
 1. **Version Validation & Properties** — Validates both databases share the same schema version, then merges property values (summing counters, preserving shared identifiers).
 
-2. **Cocktail Table Deduplication** — Compares `cyclesequencing_cocktail` and `pcr_cocktail` rows field-by-field. Duplicates are mapped to existing target IDs; unique rows get new auto-increment IDs.
+2. **Cocktail Table Deduplication** — Compares `cyclesequencing_cocktail` and `pcr_cocktail` rows field-by-field. Duplicates are mapped to existing target IDs; unique rows get new auto-increment IDs. When non-identical rows share the same name across databases, the names are prefixed with the database name to avoid ambiguity.
 
 3. **Thermocycle Hierarchy Deduplication** — Compares complete `thermocycle → cycle → state` hierarchies as a unit. Two thermocycles are duplicates only if name, all cycles (repeats, order), and all states (temp, length, order) match exactly. If notes differ between matched hierarchies, they are concatenated in the target.
 
 4. **Sequential Table Copy with Offset** — Remaining tables are copied in foreign-key dependency order. DB1 rows keep original IDs. DB2 rows get offset IDs (`original_id + DB1_row_count`). Foreign keys are adjusted using either offsets (non-deduplicated references) or mappings (deduplicated references).
+
+## Data Integrity Checks
+
+### Plan Mode Checks
+
+The plan task runs 12 validation steps before reporting whether the merge can proceed:
+
+| # | Check | Severity |
+|---|-------|----------|
+| 1 | **Database permissions** — For MySQL databases, verifies SELECT on sources and SELECT/INSERT/CREATE on target via `SHOW GRANTS`. Skipped for SQLite. | Error |
+| 2 | **Database version match** — Both databases must have the same schema version. | Error |
+| 3 | **Full version match** — The `fullDatabaseVersion` property must match. | Error |
+| 4 | **Record counts** — Counts rows in all tables in both databases. | Info |
+| 5–6 | **Cocktail deduplication** — Simulates CS and PCR cocktail dedup, identifying full-row duplicates and names that will be prefixed. | Info |
+| 7 | **Thermocycle deduplication** — Simulates thermocycle hierarchy dedup. | Info |
+| 8 | **Extraction ID uniqueness** — `extraction.extractionId` must be unique across both databases. Shows plate name and well location for any conflicts. | Error |
+| 9 | **Extraction barcode uniqueness** — Checks `extraction.extractionBarcode` for duplicates within each database and between them. Shows counts and affected plate names on console; writes full barcode/plate/well details to `duplicate_barcodes.txt`. | Warning |
+| 10 | **Plate name uniqueness** — `plate.name` must be unique across both databases. | Error |
+| 11 | **Workflow name conflicts** — Simulates the workflow renaming strategy and checks for conflicts. | Error |
+| 12 | **Duplicate plate/location reactions** — Checks for multiple extraction, PCR, or cyclesequencing reactions pointing to the same plate and well location within each database. Lists every occurrence broken down by reaction type and database. During merge, only the most recent reaction (highest id) is kept. | Warning |
+
+Errors block the merge. Warnings are reported but do not prevent merging.
+
+### Plate/Location Deduplication
+
+When multiple reactions of the same type (extraction, pcr, or cyclesequencing) share the same plate and well location within a single database, this typically indicates a re-run or correction. During merge, only the most recent reaction (highest `.id`) is copied to the target database. The plan output shows full details:
+
+```
+  DUPLICATE PLATE/LOCATION REACTIONS (will keep most recent only)
+───────────────────────────────────────────────────────────────────────────
+  extraction: 2 to skip (DB1: 1, DB2: 1)
+    DB1 extraction: MyPlate / A5 — ids [12, 45], keeping id=45, skipping 1
+    DB2 extraction: OtherPlate / B3 — ids [8, 15, 22], keeping id=22, skipping 2
+```
+
+The skip IDs are held in memory during merge (the affected set is expected to be small) and checked against each row during the streaming copy, avoiding needless re-queries.
 
 ## Table Copy Order
 
@@ -47,34 +83,12 @@ For DB2 records, foreign keys are resolved as follows:
 
 Workflow names follow the pattern `LOCUS_workflowXX`. To avoid duplicates, DB2 workflow numbers are offset by the maximum number found in DB1 for the same locus. If conflicts remain after offsetting, the merge aborts.
 
-## Build
-
-```bash
-cd db-merger
-gradle build
-
-# Build fat JAR for standalone distribution
-gradle fatJar
-```
-
-## Usage
+## Configuration
 
 ### Properties File (recommended)
 
-Edit `merger.properties` with your database URLs and credentials, then:
+Edit `merger.properties` with your database URLs and credentials:
 
-```bash
-# Plan mode
-gradle plan
-
-# Merge mode
-gradle merge
-
-# Or specify a different properties file
-gradle plan -Pconfig=/path/to/my-config.properties
-```
-
-Example `merger.properties`:
 ```properties
 db1.url=jdbc:sqlite:/path/to/database1.db
 db1.username=
@@ -93,20 +107,47 @@ target.password=
 # db.password=sharedpass
 ```
 
-### Gradle with CLI Properties
+Each database can have its own username and password. If per-database credentials are not set, the shared `db.username` / `db.password` values are used as a fallback. This allows read-only accounts on the source databases and a write-capable account on the target.
+
+### Database Permissions Required
+
+| Database | Permissions Required |
+|----------|---------------------|
+| DB1 (source) | `SELECT` only |
+| DB2 (source) | `SELECT` only |
+| Target | `SELECT`, `INSERT`, `CREATE TABLE` |
+
+For MySQL, the plan task verifies these permissions via `SHOW GRANTS`. For SQLite, file-level access is sufficient.
+
+## Build
 
 ```bash
+cd db-merger
+gradle build
+
+# Build fat JAR for standalone distribution
+gradle fatJar
+```
+
+## Usage
+
+### Gradle
+
+```bash
+# Plan mode (uses merger.properties)
+gradle plan
+
+# Merge mode
+gradle merge
+
+# Specify a different properties file
+gradle plan -Pconfig=/path/to/my-config.properties
+
+# Pass database URLs directly
 gradle plan \
   -Pdb1=jdbc:sqlite:/path/to/db1.db \
   -Pdb2=jdbc:sqlite:/path/to/db2.db \
   -Ptarget=jdbc:sqlite:/path/to/target.db
-
-gradle merge \
-  -Pdb1=jdbc:mysql://localhost:3306/labbench1 \
-  -Pdb2=jdbc:mysql://localhost:3306/labbench2 \
-  -Ptarget=jdbc:mysql://localhost:3306/labbench_merged \
-  -PdbUser=myuser \
-  -PdbPassword=mypass
 ```
 
 ### Fat JAR (standalone)
@@ -119,39 +160,21 @@ java -jar build/libs/db-merger-1.0.0-all.jar merge
 # Specify properties file
 java -jar build/libs/db-merger-1.0.0-all.jar plan /path/to/merger.properties
 
-# Full CLI args (legacy)
+# Full CLI args (legacy — shared credentials only)
 java -jar build/libs/db-merger-1.0.0-all.jar plan <db1-url> <db2-url> <target-url> [username] [password]
 ```
 
-## Example Plan Output
+## Progress Logging
 
-```
-═══════════════════════════════════════════════════════════════════════════
-  LABBENCH DATABASE MERGE PLAN
-═══════════════════════════════════════════════════════════════════════════
+Plan mode logs progress as `[Plan  1/12]` through `[Plan 12/12]`.
 
-  VERSION VALIDATION
-───────────────────────────────────────────────────────────────────────────
-  DB1 version:          11
-  DB2 version:          11
-  Versions match:       YES ✓
+Merge mode logs as `[Merge  1/17]` through `[Merge 17/17]` for each table. During streaming copy, a progress message is logged every 1,000 rows.
 
-  DEDUPLICATION ANALYSIS
-───────────────────────────────────────────────────────────────────────────
-  Table                              DB1      DB2    Dupes   Target
-  cyclesequencing_cocktail             5        4        2        7
-  pcr_cocktail                         3        3        1        5
-  thermocycle                          2        2        1        3
+## Performance Notes
 
-  ALL TABLE RECORD COUNTS
-───────────────────────────────────────────────────────────────────────────
-  Table                              DB1      DB2   Target
-  ...
-
-═══════════════════════════════════════════════════════════════════════════
-  RESULT: Merge CAN proceed ✓
-═══════════════════════════════════════════════════════════════════════════
-```
+- **Streaming copy**: Large tables are read and inserted in batches of 100 rows (configurable via `BATCH_SIZE`), keeping memory usage constant regardless of table size.
+- **Bulk thermocycle loading**: Thermocycle hierarchies are loaded in exactly 3 queries (all thermocycles, all cycles, all states) then grouped in Java, avoiding N+1 query overhead.
+- **Plate/location skip sets**: Reactions to skip during merge are identified upfront and held in a `HashSet` for O(1) lookup during streaming, adding negligible overhead.
 
 ## Error Conditions
 
@@ -159,9 +182,12 @@ java -jar build/libs/db-merger-1.0.0-all.jar plan <db1-url> <db2-url> <target-ur
 |-----------|----------|
 | Version mismatch | Abort with error message |
 | `fullDatabaseVersion` mismatch | Abort with error message |
+| Missing MySQL permissions | Abort with error message |
 | Duplicate `extraction.extractionId` between DBs | Abort with error message |
 | Duplicate `plate.name` between DBs | Abort with error message |
 | Workflow name conflict after rename | Abort with error message |
+| Duplicate `extraction.extractionBarcode` | Warning only — details written to `duplicate_barcodes.txt` |
+| Duplicate plate/location reactions | Warning only — most recent kept during merge |
 | SQL error during merge | Rollback all changes, abort |
 
 ## Logging
