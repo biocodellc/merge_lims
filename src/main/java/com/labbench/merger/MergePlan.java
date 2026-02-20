@@ -452,18 +452,19 @@ public class MergePlan {
         for (String r : permissionResults) {
             if (r.contains("MISSING") || r.contains("UNABLE TO CHECK")) { permissionsOk = false; break; }
         }
-        System.out.printf("  %s Database permissions verified%n",
-                permissionsOk ? "✓" : "✗");
+        System.out.printf("  %s %s%n", permissionsOk ? "✓" : "✗",
+                permissionsOk ? "Database permissions verified" : "Database permissions insufficient");
 
         // Version
-        System.out.printf("  %s Database versions match%n",
-                versionsMatch ? "✓" : "✗");
-        System.out.printf("  %s Full database versions match%n",
-                fullVersionsMatch ? "✓" : "✗");
+        System.out.printf("  %s %s%n", versionsMatch ? "✓" : "✗",
+                versionsMatch ? "Database versions match" : "Database versions do not match");
+        System.out.printf("  %s %s%n", fullVersionsMatch ? "✓" : "✗",
+                fullVersionsMatch ? "Full database versions match" : "Full database versions do not match");
 
         // Extraction IDs
-        System.out.printf("  %s No duplicate extraction.extractionId values between DB1 and DB2%n",
-                extractionIdsUnique ? "✓" : "✗");
+        System.out.printf("  %s %s%n", extractionIdsUnique ? "✓" : "✗",
+                extractionIdsUnique ? "No duplicate extraction.extractionId values between DB1 and DB2"
+                        : "Duplicate extraction.extractionId values found between DB1 and DB2");
 
         // Extraction barcodes (warnings only — do not block merge)
         boolean db1BarcodesOk = true, db2BarcodesOk = true, crossBarcodesOk = true;
@@ -472,27 +473,33 @@ public class MergePlan {
             if (d.startsWith("DB2 internal")) db2BarcodesOk = false;
             if (d.startsWith("Cross-database")) crossBarcodesOk = false;
         }
-        System.out.printf("  %s No duplicate extraction.extractionBarcode values within DB1%n",
-                db1BarcodesOk ? "✓" : "⚠");
-        System.out.printf("  %s No duplicate extraction.extractionBarcode values within DB2%n",
-                db2BarcodesOk ? "✓" : "⚠");
-        System.out.printf("  %s No duplicate extraction.extractionBarcode values between DB1 and DB2%n",
-                crossBarcodesOk ? "✓" : "⚠");
+        System.out.printf("  %s %s%n", db1BarcodesOk ? "✓" : "⚠",
+                db1BarcodesOk ? "No duplicate extraction.extractionBarcode values within DB1"
+                        : "Duplicate extraction.extractionBarcode values found within DB1");
+        System.out.printf("  %s %s%n", db2BarcodesOk ? "✓" : "⚠",
+                db2BarcodesOk ? "No duplicate extraction.extractionBarcode values within DB2"
+                        : "Duplicate extraction.extractionBarcode values found within DB2");
+        System.out.printf("  %s %s%n", crossBarcodesOk ? "✓" : "⚠",
+                crossBarcodesOk ? "No duplicate extraction.extractionBarcode values between DB1 and DB2"
+                        : "Duplicate extraction.extractionBarcode values found between DB1 and DB2");
 
         // Plate names
-        System.out.printf("  %s No duplicate plate.name values between DB1 and DB2%n",
-                plateNamesUnique ? "✓" : "✗");
+        System.out.printf("  %s %s%n", plateNamesUnique ? "✓" : "✗",
+                plateNamesUnique ? "No duplicate plate.name values between DB1 and DB2"
+                        : "Duplicate plate.name values found between DB1 and DB2");
 
         // Workflow names
-        System.out.printf("  %s No workflow name conflicts after applying rename offset%n",
-                !workflowRenameConflict ? "✓" : "✗");
+        System.out.printf("  %s %s%n", !workflowRenameConflict ? "✓" : "✗",
+                !workflowRenameConflict ? "No workflow name conflicts after applying rename offset"
+                        : "Workflow name conflicts detected after applying rename offset");
 
         // Plate/location duplicates (warning only — deduped during merge)
         int totalDupPlateLocCount = dupPlateLocExtractionCountDb1 + dupPlateLocExtractionCountDb2 +
                 dupPlateLocPcrCountDb1 + dupPlateLocPcrCountDb2 +
                 dupPlateLocCsCountDb1 + dupPlateLocCsCountDb2;
-        System.out.printf("  %s No duplicate plate/location reactions (extraction, pcr, cyclesequencing)%n",
-                totalDupPlateLocCount == 0 ? "✓" : "⚠");
+        System.out.printf("  %s %s%n", totalDupPlateLocCount == 0 ? "✓" : "⚠",
+                totalDupPlateLocCount == 0 ? "No duplicate plate/location reactions (extraction, pcr, cyclesequencing)"
+                        : "Duplicate plate/location reactions found (extraction, pcr, cyclesequencing)");
 
         // Summary
         System.out.println();
