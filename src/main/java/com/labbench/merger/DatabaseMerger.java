@@ -259,7 +259,8 @@ public class DatabaseMerger {
         String longText = isSQLite(targetUrl) ? "TEXT" : "LONGTEXT";
         String longBlob = isSQLite(targetUrl) ? "BLOB" : "LONGBLOB";
         String autoInc = isSQLite(targetUrl) ? "INTEGER PRIMARY KEY AUTOINCREMENT" : "INTEGER PRIMARY KEY AUTO_INCREMENT";
-        String timestampDefault = isSQLite(targetUrl) ? "TIMESTAMP DEFAULT CURRENT_TIMESTAMP" : "TIMESTAMP DEFAULT CURRENT_TIMESTAMP";
+        // For MySQL, DATE columns cannot have CURRENT_TIMESTAMP default; use DATETIME instead
+        String dateDefault = isSQLite(targetUrl) ? "DATE DEFAULT CURRENT_TIMESTAMP" : "DATETIME DEFAULT CURRENT_TIMESTAMP";
 
         // For MySQL, test if we have REFERENCES privilege. If not, create tables without FK constraints.
         boolean includeForeignKeys = true;
@@ -335,7 +336,7 @@ public class DatabaseMerger {
         // plate
         stmt.execute("CREATE TABLE IF NOT EXISTS plate (" +
                 "id " + autoInc + ", name VARCHAR(64) DEFAULT 'plate', " +
-                "date DATE DEFAULT CURRENT_TIMESTAMP, size INTEGER NOT NULL, " +
+                "date " + dateDefault + ", size INTEGER NOT NULL, " +
                 "type VARCHAR(45) NOT NULL, thermocycle INTEGER DEFAULT -1)");
 
         // pcr_thermocycle
@@ -348,7 +349,7 @@ public class DatabaseMerger {
 
         // extraction
         stmt.execute("CREATE TABLE IF NOT EXISTS extraction (" +
-                "id " + autoInc + ", date " + timestampDefault + ", " +
+                "id " + autoInc + ", date " + dateDefault + ", " +
                 "method VARCHAR(45) NOT NULL, volume DOUBLE NOT NULL, dilution DOUBLE, " +
                 "concentrationStored TINYINT DEFAULT 0 NOT NULL, concentration DOUBLE, " +
                 "parent VARCHAR(45) NOT NULL, sampleId VARCHAR(45) NOT NULL, " +
@@ -362,7 +363,7 @@ public class DatabaseMerger {
         // workflow
         stmt.execute("CREATE TABLE IF NOT EXISTS workflow (" +
                 "id " + autoInc + ", name VARCHAR(45) DEFAULT 'workflow', " +
-                "date DATE DEFAULT CURRENT_TIMESTAMP, extractionId INTEGER NOT NULL, " +
+                "date " + dateDefault + ", extractionId INTEGER NOT NULL, " +
                 "locus VARCHAR(45) DEFAULT 'COI' NOT NULL" +
                 fk_wf_ext + ")");
 
@@ -375,7 +376,7 @@ public class DatabaseMerger {
                 "reference_seq_id INTEGER, confidence_scores " + longText + ", " +
                 "trim_params_fwd " + longText + ", trim_params_rev " + longText + ", " +
                 "other_processing_fwd " + longText + ", other_processing_rev " + longText + ", " +
-                "date " + timestampDefault + ", submitted TINYINT DEFAULT 0 NOT NULL, " +
+                "date " + dateDefault + ", submitted TINYINT DEFAULT 0 NOT NULL, " +
                 "notes " + longText + ", editrecord " + longText + ", " +
                 "technician VARCHAR(255), bin VARCHAR(255), ambiguities INTEGER, " +
                 "failure_reason INTEGER, failure_notes " + longText +
@@ -383,7 +384,7 @@ public class DatabaseMerger {
 
         // gel_quantification
         stmt.execute("CREATE TABLE IF NOT EXISTS gel_quantification (" +
-                "id " + autoInc + ", date " + timestampDefault + ", " +
+                "id " + autoInc + ", date " + dateDefault + ", " +
                 "extractionId INTEGER NOT NULL, plate INTEGER NOT NULL, " +
                 "location INTEGER NOT NULL, technician VARCHAR(255), " +
                 "notes " + longText + ", volume DOUBLE, gelImage " + longBlob + ", " +
@@ -395,7 +396,7 @@ public class DatabaseMerger {
         // pcr
         stmt.execute("CREATE TABLE IF NOT EXISTS pcr (" +
                 "id " + autoInc + ", prName VARCHAR(64), prSequence VARCHAR(999), " +
-                "date " + timestampDefault + ", workflow INTEGER, " +
+                "date " + dateDefault + ", workflow INTEGER, " +
                 "plate INTEGER NOT NULL, location INTEGER NOT NULL, " +
                 "cocktail INTEGER NOT NULL, progress VARCHAR(45) NOT NULL, " +
                 "extractionId VARCHAR(45) NOT NULL, thermocycle INTEGER DEFAULT -1, " +
@@ -409,7 +410,7 @@ public class DatabaseMerger {
         stmt.execute("CREATE TABLE IF NOT EXISTS cyclesequencing (" +
                 "id " + autoInc + ", primerName VARCHAR(64) NOT NULL, " +
                 "primerSequence VARCHAR(999) NOT NULL, technician VARCHAR(90) NOT NULL, " +
-                "notes " + longText + " NOT NULL, date " + timestampDefault + ", " +
+                "notes " + longText + " NOT NULL, date " + dateDefault + ", " +
                 "workflow INTEGER, thermocycle INTEGER NOT NULL, " +
                 "plate INTEGER NOT NULL, location INTEGER NOT NULL, " +
                 "extractionId VARCHAR(45) NOT NULL, cocktail INTEGER NOT NULL, " +
