@@ -33,8 +33,8 @@ public class DatabaseMerger {
     private final Map<Integer, Integer> cycleMap = new HashMap<>();
     private final Map<Integer, Integer> stateMap = new HashMap<>();
 
-    // DB1 row counts per table (used as offset for DB2 ids)
-    private final Map<String, Long> db1Counts = new LinkedHashMap<>();
+    // DB1 max ID per table (used as offset for DB2 ids to avoid collisions)
+    private final Map<String, Long> db1MaxIds = new LinkedHashMap<>();
 
     // Workflow name remapping for DB2: db2 workflow id -> new name
     private final Map<Integer, String> workflowNameMap = new HashMap<>();
@@ -500,11 +500,66 @@ public class DatabaseMerger {
         }
     }
 
+    /**
+     * Truncate all target tables in reverse dependency order.
+     * Used with --skip-schema to ensure a clean target before merging.
+     */
+    private void truncateTargetTables(Connection target, String targetUrl) throws SQLException {
+        // Reverse dependency order: children first, parents last
+        String[] tables = {
+                "sequencing_result", "traces",
+                "cyclesequencing", "pcr", "assembly", "gel_quantification",
+                "workflow", "extraction",
+                "plate", "cyclesequencing_thermocycle", "pcr_thermocycle",
+                "gelimages", "failure_reason",
+                "state", "cycle", "thermocycle",
+                "pcr_cocktail", "cyclesequencing_cocktail",
+                "properties", "databaseversion"
+        };
+
+        if (!isSQLite(targetUrl)) {
+            // Disable FK checks for MySQL to allow truncation in any order
+            try (Statement stmt = target.createStatement()) {
+                stmt.execute("SET FOREIGN_KEY_CHECKS = 0");
+            }
+        }
+
+        try (Statement stmt = target.createStatement()) {
+            for (String table : tables) {
+                try {
+                    if (isSQLite(targetUrl)) {
+                        stmt.execute("DELETE FROM " + table);
+                    } else {
+                        stmt.execute("TRUNCATE TABLE " + table);
+                    }
+                    log.debug("  Truncated {}", table);
+                } catch (SQLException e) {
+                    log.debug("  Could not truncate {} (may not exist): {}", table, e.getMessage());
+                }
+            }
+        }
+
+        if (!isSQLite(targetUrl)) {
+            try (Statement stmt = target.createStatement()) {
+                stmt.execute("SET FOREIGN_KEY_CHECKS = 1");
+            }
+        }
+        log.info("Target tables truncated.");
+    }
+
     // ─── Utility: count rows ───────────────────────────────────────────
 
     private long countRows(Connection conn, String table) throws SQLException {
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + table)) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    private long maxId(Connection conn, String table) throws SQLException {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COALESCE(MAX(id), 0) FROM " + table)) {
             rs.next();
             return rs.getLong(1);
         }
@@ -1416,13 +1471,8 @@ public class DatabaseMerger {
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
             ResultSetMetaData meta = rs.getMetaData();
-            int cols = meta.getColumnCount();
             while (rs.next()) {
-                Map<String, Object> row = new LinkedHashMap<>();
-                for (int i = 1; i <= cols; i++) {
-                    row.put(meta.getColumnLabel(i).toLowerCase(), rs.getObject(i));
-                }
-                rows.add(row);
+                rows.add(readRow(rs, meta));
             }
         }
         return rows;
@@ -1430,12 +1480,18 @@ public class DatabaseMerger {
 
     /**
      * Read a single row from a ResultSet into a Map.
+     * Normalizes MySQL TINYINT(1) Boolean values to Integer (0/1) for cross-DB compatibility.
      */
     private Map<String, Object> readRow(ResultSet rs, ResultSetMetaData meta) throws SQLException {
         int cols = meta.getColumnCount();
         Map<String, Object> row = new LinkedHashMap<>();
         for (int i = 1; i <= cols; i++) {
-            row.put(meta.getColumnLabel(i).toLowerCase(), rs.getObject(i));
+            Object val = rs.getObject(i);
+            // MySQL JDBC returns Boolean for TINYINT(1); normalize to Integer
+            if (val instanceof Boolean) {
+                val = ((Boolean) val) ? 1 : 0;
+            }
+            row.put(meta.getColumnLabel(i).toLowerCase(), val);
         }
         return row;
     }
@@ -1456,9 +1512,13 @@ public class DatabaseMerger {
                                Connection target, String insertSql, String[] colNames,
                                RowTransformer transformer) throws SQLException {
         long count = 0;
-        try (Statement stmt = source.createStatement();
-             ResultSet rs = stmt.executeQuery(selectSql);
-             PreparedStatement ps = target.prepareStatement(insertSql)) {
+        try (Statement stmt = source.createStatement()) {
+            // Enable streaming for MySQL (avoids loading entire ResultSet into memory).
+            // Integer.MIN_VALUE is MySQL JDBC's convention for streaming mode.
+            // SQLite ignores this or may throw, so we catch and ignore.
+            try { stmt.setFetchSize(Integer.MIN_VALUE); } catch (SQLException ignored) {}
+            try (ResultSet rs = stmt.executeQuery(selectSql);
+                 PreparedStatement ps = target.prepareStatement(insertSql)) {
             ResultSetMetaData meta = rs.getMetaData();
             int batchCount = 0;
             while (rs.next()) {
@@ -1481,7 +1541,8 @@ public class DatabaseMerger {
             if (batchCount > 0) {
                 ps.executeBatch();
             }
-        }
+            } // close inner try (rs, ps)
+        } // close outer try (stmt)
         return count;
     }
 
@@ -1497,9 +1558,10 @@ public class DatabaseMerger {
         }
         long count = 0;
         long skipped = 0;
-        try (Statement stmt = source.createStatement();
-             ResultSet rs = stmt.executeQuery(selectSql);
-             PreparedStatement ps = target.prepareStatement(insertSql)) {
+        try (Statement stmt = source.createStatement()) {
+            try { stmt.setFetchSize(Integer.MIN_VALUE); } catch (SQLException ignored) {}
+            try (ResultSet rs = stmt.executeQuery(selectSql);
+                 PreparedStatement ps = target.prepareStatement(insertSql)) {
             ResultSetMetaData meta = rs.getMetaData();
             int batchCount = 0;
             while (rs.next()) {
@@ -1527,7 +1589,8 @@ public class DatabaseMerger {
             if (batchCount > 0) {
                 ps.executeBatch();
             }
-        }
+            } // close inner try (rs, ps)
+        } // close outer try (stmt)
         if (skipped > 0) {
             log.info("    Skipped {} duplicate plate/location rows", skipped);
         }
@@ -1541,14 +1604,23 @@ public class DatabaseMerger {
             Object v2 = r2.get(key);
             if (v1 == null && v2 == null) continue;
             if (v1 == null || v2 == null) return false;
-            // Handle numeric comparison (different DB types may return different Number types)
-            if (v1 instanceof Number && v2 instanceof Number) {
-                if (((Number) v1).doubleValue() != ((Number) v2).doubleValue()) return false;
-            } else if (!v1.toString().equals(v2.toString())) {
-                return false;
-            }
+            if (!valuesEqual(v1, v2)) return false;
         }
         return true;
+    }
+
+    private boolean valuesEqual(Object v1, Object v2) {
+        // Handle numeric comparison (different DB drivers may return Integer, Long, BigDecimal, etc.)
+        if (v1 instanceof Number && v2 instanceof Number) {
+            return Double.compare(((Number) v1).doubleValue(), ((Number) v2).doubleValue()) == 0;
+        }
+        // Handle byte array comparison (BLOBs)
+        if (v1 instanceof byte[] && v2 instanceof byte[]) {
+            return java.util.Arrays.equals((byte[]) v1, (byte[]) v2);
+        }
+        // Handle date/time: normalize to string for cross-DB comparison
+        // (SQLite may return String, MySQL may return java.sql.Date/Timestamp/LocalDateTime)
+        return v1.toString().equals(v2.toString());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1602,6 +1674,9 @@ public class DatabaseMerger {
                 // Create schema (or skip if tables already exist)
                 if (skipSchema) {
                     log.info("[Merge  1/17] Skipping schema creation (--skip-schema)");
+                    // Truncate all tables in reverse dependency order to ensure clean target
+                    log.info("[Merge] Truncating existing target tables...");
+                    truncateTargetTables(target, targetUrl);
                 } else {
                     log.info("[Merge  1/17] Creating target schema...");
                     createTargetSchema(target, targetUrl);
@@ -1909,7 +1984,7 @@ public class DatabaseMerger {
             }
         }
 
-        db1Counts.put("cyclesequencing_cocktail", (long) db1Rows.size());
+        db1MaxIds.put("cyclesequencing_cocktail", (long) db1Rows.size());
         log.info("  DB2: {} duplicates, {} new insertions", dupes, inserted);
     }
 
@@ -2030,7 +2105,7 @@ public class DatabaseMerger {
             }
         }
 
-        db1Counts.put("pcr_cocktail", (long) db1Rows.size());
+        db1MaxIds.put("pcr_cocktail", (long) db1Rows.size());
         log.info("  DB2: {} duplicates, {} new insertions", dupes, inserted);
     }
 
@@ -2077,9 +2152,9 @@ public class DatabaseMerger {
         int db1CycleCount = h1.stream().mapToInt(th -> th.cycles.size()).sum();
         int db1StateCount = h1.stream().flatMap(th -> th.cycles.stream()).mapToInt(c -> c.states.size()).sum();
 
-        db1Counts.put("thermocycle", (long) db1ThermocycleCount);
-        db1Counts.put("cycle", (long) db1CycleCount);
-        db1Counts.put("state", (long) db1StateCount);
+        db1MaxIds.put("thermocycle", (long) db1ThermocycleCount);
+        db1MaxIds.put("cycle", (long) db1CycleCount);
+        db1MaxIds.put("state", (long) db1StateCount);
 
         log.info("  Copied from DB1: {} thermocycles, {} cycles, {} states",
                 db1ThermocycleCount, db1CycleCount, db1StateCount);
@@ -2189,14 +2264,17 @@ public class DatabaseMerger {
         log.info("Merging table: {}", tableName);
         String[] colNames = cols.split(",\\s*");
 
+        // Get max ID from DB1 for offset calculation
+        long db1MaxId = maxId(conn1, tableName);
+        db1MaxIds.put(tableName, db1MaxId);
+
         // Stream DB1
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put(tableName, db1Count);
-        log.info("  Copied {} rows from DB1", db1Count);
+        log.info("  Copied {} rows from DB1 (maxId={})", db1Count, db1MaxId);
 
         // Stream DB2 with offset and FK mapping
-        final long offset = db1Count;
+        final long offset = db1MaxId;
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     int origId = ((Number) row.get("id")).intValue();
@@ -2223,14 +2301,16 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO gelimages (id, name, plate, imageData, notes) VALUES (?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "gelimages");
+        db1MaxIds.put("gelimages", db1MaxId);
+
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM gelimages ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put("gelimages", db1Count);
-        final long plateOffset = db1Counts.getOrDefault("plate", 0L);
+        final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM gelimages ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "plate", plateOffset);
                 });
 
@@ -2244,13 +2324,15 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO plate (id, name, date, size, type, thermocycle) VALUES (?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "plate");
+        db1MaxIds.put("plate", db1MaxId);
+
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put("plate", db1Count);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     Object tcVal = row.get("thermocycle");
                     if (tcVal != null) {
                         int tcId = ((Number) tcVal).intValue();
@@ -2275,14 +2357,16 @@ public class DatabaseMerger {
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "extraction");
+        db1MaxIds.put("extraction", db1MaxId);
+
         long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM extraction ORDER BY id"),
                 target, insertSql, colNames, null, extractionSkipIds);
-        db1Counts.put("extraction", db1Count);
-        final long plateOffset = db1Counts.getOrDefault("plate", 0L);
+        final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
         long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM extraction ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "plate", plateOffset);
                 }, extractionSkipIds);
 
@@ -2299,15 +2383,17 @@ public class DatabaseMerger {
         // Get DB1 max workflow number per locus for name offsetting
         Map<String, Integer> db1MaxPerLocus = getWorkflowMaxPerLocus(conn1);
 
+        long db1MaxId = maxId(conn1, "workflow");
+        db1MaxIds.put("workflow", db1MaxId);
+
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM workflow ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put("workflow", db1Count);
-        final long extractionOffset = db1Counts.getOrDefault("extraction", 0L);
+        final long extractionOffset = db1MaxIds.getOrDefault("extraction", 0L);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM workflow ORDER BY id"),
                 target, insertSql, colNames, row -> {
                     int origId = ((Number) row.get("id")).intValue();
-                    row.put("id", (int) (origId + db1Count));
+                    row.put("id", (int) (origId + db1MaxId));
                     applyOffset(row, "extractionid", extractionOffset);
 
                     // Rename workflow
@@ -2338,15 +2424,17 @@ public class DatabaseMerger {
                 "threshold, aboveThreshold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "gel_quantification");
+        db1MaxIds.put("gel_quantification", db1MaxId);
+
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM gel_quantification ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put("gel_quantification", db1Count);
-        final long extractionOffset = db1Counts.getOrDefault("extraction", 0L);
-        final long plateOffset = db1Counts.getOrDefault("plate", 0L);
+        final long extractionOffset = db1MaxIds.getOrDefault("extraction", 0L);
+        final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM gel_quantification ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "extractionid", extractionOffset);
                     applyOffset(row, "plate", plateOffset);
                 });
@@ -2365,15 +2453,17 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO assembly (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "assembly");
+        db1MaxIds.put("assembly", db1MaxId);
+
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM assembly ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put("assembly", db1Count);
-        final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
-        final long frOffset = db1Counts.getOrDefault("failure_reason", 0L);
+        final long workflowOffset = db1MaxIds.getOrDefault("workflow", 0L);
+        final long frOffset = db1MaxIds.getOrDefault("failure_reason", 0L);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM assembly ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "workflow", workflowOffset);
                     Object frVal = row.get("failure_reason");
                     if (frVal != null) {
@@ -2394,15 +2484,17 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO pcr (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "pcr");
+        db1MaxIds.put("pcr", db1MaxId);
+
         long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM pcr ORDER BY id"),
                 target, insertSql, colNames, null, pcrSkipIds);
-        db1Counts.put("pcr", db1Count);
-        final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
-        final long plateOffset = db1Counts.getOrDefault("plate", 0L);
+        final long workflowOffset = db1MaxIds.getOrDefault("workflow", 0L);
+        final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
         long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM pcr ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "workflow", workflowOffset);
                     applyOffset(row, "plate", plateOffset);
                     applyMapping(row, "cocktail", pcrCocktailMap);
@@ -2428,15 +2520,17 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO cyclesequencing (" + cols + ") VALUES (" + placeholders + ")";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "cyclesequencing");
+        db1MaxIds.put("cyclesequencing", db1MaxId);
+
         long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM cyclesequencing ORDER BY id"),
                 target, insertSql, colNames, null, csSkipIds);
-        db1Counts.put("cyclesequencing", db1Count);
-        final long workflowOffset = db1Counts.getOrDefault("workflow", 0L);
-        final long plateOffset = db1Counts.getOrDefault("plate", 0L);
+        final long workflowOffset = db1MaxIds.getOrDefault("workflow", 0L);
+        final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
         long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM cyclesequencing ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "workflow", workflowOffset);
                     applyOffset(row, "plate", plateOffset);
                     applyMapping(row, "cocktail", cscocktailMap);
@@ -2459,14 +2553,16 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO traces (id, reaction, name, data) VALUES (?, ?, ?, ?)";
         String[] colNames = cols.split(",\\s*");
 
+        long db1MaxId = maxId(conn1, "traces");
+        db1MaxIds.put("traces", db1MaxId);
+
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM traces ORDER BY id"),
                 target, insertSql, colNames, null);
-        db1Counts.put("traces", db1Count);
-        final long csOffset = db1Counts.getOrDefault("cyclesequencing", 0L);
+        final long csOffset = db1MaxIds.getOrDefault("cyclesequencing", 0L);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM traces ORDER BY id"),
                 target, insertSql, colNames, row -> {
-                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1Count);
+                    row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "reaction", csOffset);
                 });
 
@@ -2482,9 +2578,8 @@ public class DatabaseMerger {
 
         long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM sequencing_result"),
                 target, insertSql, colNames, null);
-        db1Counts.put("sequencing_result", db1Count);
-        final long csOffset = db1Counts.getOrDefault("cyclesequencing", 0L);
-        final long assemblyOffset = db1Counts.getOrDefault("assembly", 0L);
+        final long csOffset = db1MaxIds.getOrDefault("cyclesequencing", 0L);
+        final long assemblyOffset = db1MaxIds.getOrDefault("assembly", 0L);
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM sequencing_result"),
                 target, insertSql, colNames, row -> {
@@ -2540,6 +2635,8 @@ public class DatabaseMerger {
             Object val = row.get(col);
             if (val == null) {
                 ps.setNull(i + 1, Types.NULL);
+            } else if (val instanceof Boolean) {
+                ps.setInt(i + 1, (Boolean) val ? 1 : 0);
             } else if (val instanceof Integer) {
                 ps.setInt(i + 1, (Integer) val);
             } else if (val instanceof Long) {
@@ -2548,14 +2645,33 @@ public class DatabaseMerger {
                 ps.setDouble(i + 1, (Double) val);
             } else if (val instanceof Float) {
                 ps.setFloat(i + 1, (Float) val);
+            } else if (val instanceof java.math.BigDecimal) {
+                ps.setBigDecimal(i + 1, (java.math.BigDecimal) val);
+            } else if (val instanceof java.math.BigInteger) {
+                ps.setLong(i + 1, ((java.math.BigInteger) val).longValue());
+            } else if (val instanceof Number) {
+                // Catch-all for any other numeric type
+                ps.setDouble(i + 1, ((Number) val).doubleValue());
             } else if (val instanceof byte[]) {
                 ps.setBytes(i + 1, (byte[]) val);
             } else if (val instanceof java.sql.Timestamp) {
                 ps.setTimestamp(i + 1, (java.sql.Timestamp) val);
             } else if (val instanceof java.sql.Date) {
                 ps.setDate(i + 1, (java.sql.Date) val);
+            } else if (val instanceof java.time.LocalDateTime) {
+                ps.setTimestamp(i + 1, java.sql.Timestamp.valueOf((java.time.LocalDateTime) val));
+            } else if (val instanceof java.time.LocalDate) {
+                ps.setDate(i + 1, java.sql.Date.valueOf((java.time.LocalDate) val));
             } else {
-                ps.setString(i + 1, val.toString());
+                // Handle SQLite boolean strings ("true"/"false") for MySQL TINYINT columns
+                String strVal = val.toString();
+                if ("true".equalsIgnoreCase(strVal)) {
+                    ps.setInt(i + 1, 1);
+                } else if ("false".equalsIgnoreCase(strVal)) {
+                    ps.setInt(i + 1, 0);
+                } else {
+                    ps.setString(i + 1, strVal);
+                }
             }
         }
     }
