@@ -77,6 +77,8 @@ public class DatabaseMerger {
         String targetPassword = null;
         boolean skipSchema = false;
         boolean testMode = false;
+        boolean resume = false;
+        boolean serverSide = false;
 
         // First arg is always the mode
         mode = args[0].toLowerCase();
@@ -88,6 +90,12 @@ public class DatabaseMerger {
             }
             if ("--test".equals(arg)) {
                 testMode = true;
+            }
+            if ("--resume".equals(arg)) {
+                resume = true;
+            }
+            if ("--server-side".equals(arg)) {
+                serverSide = true;
             }
         }
 
@@ -133,6 +141,14 @@ public class DatabaseMerger {
                 String testModeProp = props.getProperty("test.mode");
                 if ("true".equalsIgnoreCase(testModeProp)) testMode = true;
 
+                // Optional: resume mode
+                String resumeProp = props.getProperty("resume");
+                if ("true".equalsIgnoreCase(resumeProp)) resume = true;
+
+                // Optional: server-side transfer
+                String serverSideProp = props.getProperty("server.side");
+                if ("true".equalsIgnoreCase(serverSideProp)) serverSide = true;
+
                 log.info("Loaded configuration from {}", propsFile.getAbsolutePath());
             } catch (java.io.IOException e) {
                 log.warn("Failed to load properties file: {}", e.getMessage());
@@ -177,7 +193,7 @@ public class DatabaseMerger {
                     merger.runMerge(db1Url, db1Username, db1Password,
                                    db2Url, db2Username, db2Password,
                                    targetUrl, targetUsername, targetPassword,
-                                   skipSchema, testMode);
+                                   skipSchema, testMode, resume, serverSide);
                     break;
             }
         } catch (Exception e) {
@@ -222,6 +238,8 @@ public class DatabaseMerger {
         System.out.println("Options:");
         System.out.println("  --skip-schema   Skip CREATE TABLE statements (tables must already exist)");
         System.out.println("  --test          Test mode: copy only 10 rows per table (tier 1 and above)");
+        System.out.println("  --resume        Resume a previously interrupted merge from where it left off");
+        System.out.println("  --server-side   Use INSERT INTO...SELECT for DB1 tables when DB1 and target are on the same MySQL server");
     }
 
     // ─── Connection helper ─────────────────────────────────────────────
@@ -230,10 +248,13 @@ public class DatabaseMerger {
         if (url.startsWith("jdbc:sqlite:")) {
             return DriverManager.getConnection(url);
         } else {
+            // Append socket and connect timeout for MySQL connections
+            String separator = url.contains("?") ? "&" : "?";
+            String timedUrl = url + separator + "socketTimeout=90000&connectTimeout=30000";
             if (username != null && password != null) {
-                return DriverManager.getConnection(url, username, password);
+                return DriverManager.getConnection(timedUrl, username, password);
             } else {
-                return DriverManager.getConnection(url);
+                return DriverManager.getConnection(timedUrl);
             }
         }
     }
@@ -264,6 +285,90 @@ public class DatabaseMerger {
         }
         return url;
     }
+
+    /**
+     * Extract host:port from a MySQL JDBC URL.
+     * e.g. "jdbc:mysql://localhost:3306/mydb?param=val" -> "localhost:3306"
+     * Returns null for non-MySQL URLs.
+     */
+    private String mysqlHostPort(String url) {
+        if (url == null || !url.startsWith("jdbc:mysql://")) return null;
+        String after = url.substring("jdbc:mysql://".length()); // "host:port/db?params"
+        int slashIdx = after.indexOf('/');
+        return slashIdx > 0 ? after.substring(0, slashIdx) : after;
+    }
+
+    /**
+     * Test whether the target connection can SELECT from the DB1 database.
+     */
+    private boolean testCrossDbAccess(Connection target, String db1Schema) {
+        try (Statement stmt = target.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT 1 FROM " + db1Schema + ".databaseversion LIMIT 1")) {
+            return true;
+        } catch (SQLException e) {
+            log.warn("Cross-database access test failed (target cannot SELECT from {}): {}", db1Schema, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Server-side INSERT INTO ... SELECT for a DB1 table. Data stays entirely within
+     * the MySQL server — no transfer through the Java process.
+     *
+     * @param target     target connection
+     * @param db1Schema  DB1 schema/database name
+     * @param tableName  table to copy
+     * @param cols       column list
+     * @param whereClause optional WHERE clause (e.g. "WHERE id NOT IN (...)")  or null
+     * @return number of rows inserted
+     */
+    private long serverSideCopyDb1(Connection target, String db1Schema, String tableName,
+                                    String cols, String whereClause) throws SQLException {
+        String targetSchema = dbNameFromUrl(target.getMetaData().getURL());
+        // Check if table has an 'id' column (sequencing_result doesn't)
+        boolean hasId = cols.toLowerCase().startsWith("id,") || cols.toLowerCase().startsWith("id ");
+        String sql = "INSERT INTO " + targetSchema + "." + tableName + " (" + cols + ") " +
+                "SELECT " + cols + " FROM " + db1Schema + "." + tableName +
+                (whereClause != null ? " " + whereClause : "") +
+                (hasId ? " ORDER BY id" : "") +
+                (testRowLimit > 0 ? " LIMIT " + testRowLimit : "");
+        log.debug("  Server-side SQL: {}", sql);
+        try (Statement stmt = target.createStatement()) {
+            long rows = stmt.executeUpdate(sql);
+            return rows;
+        }
+    }
+
+    /**
+     * Server-side UPDATE to prefix duplicate cocktail names for DB1 rows already in the target.
+     */
+    private void serverSidePrefixNames(Connection target, String tableName, Set<String> dupNames, String prefix) throws SQLException {
+        if (dupNames.isEmpty()) return;
+        // Build WHERE name IN (...)
+        StringBuilder inClause = new StringBuilder("(");
+        int i = 0;
+        for (String name : dupNames) {
+            if (i > 0) inClause.append(", ");
+            inClause.append("'").append(name.replace("'", "''")).append("'");
+            i++;
+        }
+        inClause.append(")");
+
+        String sql = "UPDATE " + tableName + " SET name = CONCAT('" + prefix.replace("'", "''") +
+                ":', name) WHERE name IN " + inClause +
+                " AND name NOT LIKE '%:%'";  // Don't double-prefix
+        log.debug("  Prefix SQL: {}", sql);
+        try (Statement stmt = target.createStatement()) {
+            int updated = stmt.executeUpdate(sql);
+            if (updated > 0) {
+                log.info("  Prefixed {} duplicate {} names with '{}'", updated, tableName, prefix);
+            }
+        }
+    }
+
+    // Instance flag: whether server-side transfer is active for this merge
+    private boolean useServerSide = false;
+    private String db1Schema = null;
 
     // Duplicate name sets computed during merge for cocktail name prefixing
     private final Set<String> csCocktailDupNames = new HashSet<>();
@@ -1597,6 +1702,242 @@ public class DatabaseMerger {
         return count;
     }
 
+    /**
+     * Like streamingCopy, but commits after every batch.
+     * Used for large BLOB tables (gelimages, traces) so that progress survives a crash.
+     */
+    private long streamingCopyWithCommit(Connection source, String selectSql,
+                                          Connection target, String insertSql, String[] colNames,
+                                          RowTransformer transformer) throws SQLException {
+        long count = 0;
+        try (Statement stmt = source.createStatement()) {
+            try { stmt.setFetchSize(Integer.MIN_VALUE); } catch (SQLException ignored) {}
+            try (ResultSet rs = stmt.executeQuery(selectSql);
+                 PreparedStatement ps = target.prepareStatement(insertSql)) {
+            ResultSetMetaData meta = rs.getMetaData();
+            int batchCount = 0;
+            while (rs.next()) {
+                Map<String, Object> row = readRow(rs, meta);
+                if (transformer != null) {
+                    transformer.transform(row);
+                }
+                setRowParams(ps, row, colNames);
+                ps.addBatch();
+                batchCount++;
+                count++;
+                if (batchCount >= BATCH_SIZE) {
+                    ps.executeBatch();
+                    target.commit();
+                    batchCount = 0;
+                    if (count % (BATCH_SIZE * 10) == 0) {
+                        log.info("    ... {} rows committed", count);
+                    }
+                }
+            }
+            if (batchCount > 0) {
+                ps.executeBatch();
+                target.commit();
+            }
+            } // close inner try (rs, ps)
+        } // close outer try (stmt)
+        log.info("    ... {} rows total (copy complete)", count);
+        return count;
+    }
+
+    /**
+     * Resumable streaming copy for a single table. Checks the max ID already in the target
+     * and reads only rows beyond that point from each source. Commits after each batch.
+     *
+     * DB1 rows are inserted with original IDs; DB2 rows get IDs offset by db1MaxId.
+     * So target IDs 1..db1MaxId came from DB1, and db1MaxId+1.. came from DB2.
+     * We use the target's max(id) to determine which source(s) still need work.
+     *
+     * When useServerSide is active and db1Transform is null, DB1 rows are transferred
+     * via INSERT INTO...SELECT entirely within the MySQL server.
+     */
+    private long resumableCopy(Connection conn1, Connection conn2, Connection target,
+                               String tableName, String cols, String insertSql, String[] colNames,
+                               RowTransformer db1Transform, RowTransformer db2Transform) throws SQLException {
+        long db1MaxId = db1MaxIds.getOrDefault(tableName, 0L);
+        long targetMaxId = maxId(target, tableName);
+        boolean ssEligible = useServerSide && db1Transform == null;
+
+        long db1Count = 0;
+        long db2Count = 0;
+
+        if (targetMaxId == 0) {
+            if (ssEligible) {
+                db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, null);
+                log.info("  Copied {} rows from DB1 (server-side)", db1Count);
+            } else {
+                db1Count = streamingCopyWithCommit(conn1,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                        target, insertSql, colNames, db1Transform);
+            }
+            db2Count = streamingCopyWithCommit(conn2,
+                    limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                    target, insertSql, colNames, db2Transform);
+        } else if (targetMaxId < db1MaxId) {
+            log.info("  Resuming DB1 from id > {} (target maxId={})", targetMaxId, targetMaxId);
+            if (ssEligible) {
+                db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, "WHERE id > " + targetMaxId);
+                log.info("  Copied {} rows from DB1 (server-side, resumed)", db1Count);
+            } else {
+                db1Count = streamingCopyWithCommit(conn1,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " WHERE id > " + targetMaxId + " ORDER BY id"),
+                        target, insertSql, colNames, db1Transform);
+            }
+            db2Count = streamingCopyWithCommit(conn2,
+                    limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                    target, insertSql, colNames, db2Transform);
+        } else if (targetMaxId >= db1MaxId) {
+            long db2ResumeFrom = targetMaxId - db1MaxId;
+            if (db2ResumeFrom > 0) {
+                log.info("  DB1 complete. Resuming DB2 from id > {} (target maxId={})", db2ResumeFrom, targetMaxId);
+                db2Count = streamingCopyWithCommit(conn2,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " WHERE id > " + db2ResumeFrom + " ORDER BY id"),
+                        target, insertSql, colNames, db2Transform);
+            } else {
+                db2Count = streamingCopyWithCommit(conn2,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                        target, insertSql, colNames, db2Transform);
+            }
+        }
+
+        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+        return db1Count + db2Count;
+    }
+
+    /**
+     * Like resumableCopy but uses streamingCopyWithSkipAndCommit for tables with plate/location dedup.
+     * Server-side mode uses WHERE id NOT IN (...) for DB1 skip IDs.
+     */
+    private long resumableCopyWithSkip(Connection conn1, Connection conn2, Connection target,
+                                        String tableName, String cols, String insertSql, String[] colNames,
+                                        RowTransformer db1Transform, RowTransformer db2Transform,
+                                        Set<Integer> skipIds) throws SQLException {
+        long db1MaxId = db1MaxIds.getOrDefault(tableName, 0L);
+        long targetMaxId = maxId(target, tableName);
+        boolean ssEligible = useServerSide && db1Transform == null;
+
+        // Build server-side skip clause for DB1 IDs
+        String ssSkipClause = null;
+        if (ssEligible && skipIds != null && !skipIds.isEmpty()) {
+            StringBuilder sb = new StringBuilder("id NOT IN (");
+            int cnt = 0;
+            for (int skipId : skipIds) {
+                if (skipId <= db1MaxId) {
+                    if (cnt > 0) sb.append(", ");
+                    sb.append(skipId);
+                    cnt++;
+                }
+            }
+            sb.append(")");
+            if (cnt > 0) ssSkipClause = sb.toString();
+        }
+
+        long db1Count = 0;
+        long db2Count = 0;
+
+        if (targetMaxId == 0) {
+            if (ssEligible) {
+                String where = ssSkipClause != null ? "WHERE " + ssSkipClause : null;
+                db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, where);
+                log.info("  Copied {} rows from DB1 (server-side)", db1Count);
+            } else {
+                db1Count = streamingCopyWithSkipAndCommit(conn1,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                        target, insertSql, colNames, db1Transform, skipIds);
+            }
+            db2Count = streamingCopyWithSkipAndCommit(conn2,
+                    limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                    target, insertSql, colNames, db2Transform, skipIds);
+        } else if (targetMaxId < db1MaxId) {
+            log.info("  Resuming DB1 from id > {} (target maxId={})", targetMaxId, targetMaxId);
+            if (ssEligible) {
+                String where = "WHERE id > " + targetMaxId;
+                if (ssSkipClause != null) where += " AND " + ssSkipClause;
+                db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, where);
+                log.info("  Copied {} rows from DB1 (server-side, resumed)", db1Count);
+            } else {
+                db1Count = streamingCopyWithSkipAndCommit(conn1,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " WHERE id > " + targetMaxId + " ORDER BY id"),
+                        target, insertSql, colNames, db1Transform, skipIds);
+            }
+            db2Count = streamingCopyWithSkipAndCommit(conn2,
+                    limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                    target, insertSql, colNames, db2Transform, skipIds);
+        } else if (targetMaxId >= db1MaxId) {
+            long db2ResumeFrom = targetMaxId - db1MaxId;
+            if (db2ResumeFrom > 0) {
+                log.info("  DB1 complete. Resuming DB2 from id > {} (target maxId={})", db2ResumeFrom, targetMaxId);
+                db2Count = streamingCopyWithSkipAndCommit(conn2,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " WHERE id > " + db2ResumeFrom + " ORDER BY id"),
+                        target, insertSql, colNames, db2Transform, skipIds);
+            } else {
+                db2Count = streamingCopyWithSkipAndCommit(conn2,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                        target, insertSql, colNames, db2Transform, skipIds);
+            }
+        }
+
+        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+        return db1Count + db2Count;
+    }
+
+    /**
+     * Like streamingCopyWithSkip, but commits after every batch for crash resilience.
+     */
+    private long streamingCopyWithSkipAndCommit(Connection source, String selectSql,
+                                                 Connection target, String insertSql, String[] colNames,
+                                                 RowTransformer transformer, Set<Integer> skipIds) throws SQLException {
+        if (skipIds == null || skipIds.isEmpty()) {
+            return streamingCopyWithCommit(source, selectSql, target, insertSql, colNames, transformer);
+        }
+        long count = 0;
+        long skipped = 0;
+        try (Statement stmt = source.createStatement()) {
+            try { stmt.setFetchSize(Integer.MIN_VALUE); } catch (SQLException ignored) {}
+            try (ResultSet rs = stmt.executeQuery(selectSql);
+                 PreparedStatement ps = target.prepareStatement(insertSql)) {
+            ResultSetMetaData meta = rs.getMetaData();
+            int batchCount = 0;
+            while (rs.next()) {
+                Map<String, Object> row = readRow(rs, meta);
+                int origId = ((Number) row.get("id")).intValue();
+                if (skipIds.contains(origId)) {
+                    skipped++;
+                    continue;
+                }
+                if (transformer != null) {
+                    transformer.transform(row);
+                }
+                setRowParams(ps, row, colNames);
+                ps.addBatch();
+                batchCount++;
+                count++;
+                if (batchCount >= BATCH_SIZE) {
+                    ps.executeBatch();
+                    target.commit();
+                    batchCount = 0;
+                    if (count % (BATCH_SIZE * 10) == 0) {
+                        log.info("    ... {} rows committed", count);
+                    }
+                }
+            }
+            if (batchCount > 0) {
+                ps.executeBatch();
+                target.commit();
+            }
+            } // close inner try (rs, ps)
+        } // close outer try (stmt)
+        if (skipped > 0) {
+            log.info("    Skipped {} duplicate plate/location rows", skipped);
+        }
+        log.info("    ... {} rows total (copy complete)", count);
+        return count;
+    }
+
     private boolean rowsEqual(Map<String, Object> r1, Map<String, Object> r2) {
         if (r1.size() != r2.size()) return false;
         for (String key : r1.keySet()) {
@@ -1630,16 +1971,20 @@ public class DatabaseMerger {
     public void runMerge(String db1Url, String db1Username, String db1Password,
                          String db2Url, String db2Username, String db2Password,
                          String targetUrl, String targetUsername, String targetPassword,
-                         boolean skipSchema, boolean testMode) throws Exception {
+                         boolean skipSchema, boolean testMode, boolean resume, boolean serverSide) throws Exception {
         if (testMode) {
             testRowLimit = 10;
             log.info("*** TEST MODE: limiting to {} rows per table (tier 1+) ***", testRowLimit);
         }
         log.info("Starting database merge...");
 
-        try (Connection conn1 = connect(db1Url, db1Username, db1Password);
-             Connection conn2 = connect(db2Url, db2Username, db2Password);
-             Connection target = connect(targetUrl, targetUsername, targetPassword)) {
+        Connection conn1 = null;
+        Connection conn2 = null;
+        Connection target = null;
+        try {
+            conn1 = connect(db1Url, db1Username, db1Password);
+            conn2 = connect(db2Url, db2Username, db2Password);
+            target = connect(targetUrl, targetUsername, targetPassword);
 
             conn1.setAutoCommit(true); // read-only sources
             conn2.setAutoCommit(true);
@@ -1647,107 +1992,541 @@ public class DatabaseMerger {
 
             if (isSQLite(targetUrl)) {
                 target.createStatement().execute("PRAGMA foreign_keys = OFF");
+            } else {
+                // Disable FK constraint checking during merge for performance.
+                // We control data integrity ourselves via ID offsets and FK remapping.
+                target.createStatement().execute("SET FOREIGN_KEY_CHECKS = 0");
+                log.info("Disabled MySQL foreign key checks for merge performance.");
             }
 
-            try {
-                // Validate first
-                log.info("[Merge] Running pre-merge validation...");
-                MergePlan plan = buildPlan(conn1, conn2, db1Url, db2Url, targetUrl, target);
-                if (!plan.canProceed()) {
-                    plan.printReport();
-                    throw new RuntimeException("Pre-merge validation failed. See errors above.");
-                }
-                log.info("[Merge] Pre-merge validation passed.");
-
-                // Set DB names for name prefixing
-                db1Name = dbNameFromUrl(db1Url);
-                db2Name = dbNameFromUrl(db2Url);
-
-                // Compute duplicate cocktail name sets for name prefixing during merge
-                log.info("[Merge] Computing cocktail duplicate names...");
-                computeCocktailDupNames(conn1, conn2);
-
-                // Compute plate/location duplicate skip sets
-                log.info("[Merge] Computing plate/location duplicate skip IDs...");
-                computePlateLocationSkipIds(conn1, conn2);
-
-                // Create schema (or skip if tables already exist)
-                if (skipSchema) {
-                    log.info("[Merge  1/17] Skipping schema creation (--skip-schema)");
-                    // Truncate all tables in reverse dependency order to ensure clean target
-                    log.info("[Merge] Truncating existing target tables...");
-                    truncateTargetTables(target, targetUrl);
+            // Detect and validate server-side transfer mode
+            if (serverSide) {
+                String db1Host = mysqlHostPort(db1Url);
+                String targetHost = mysqlHostPort(targetUrl);
+                db1Schema = dbNameFromUrl(db1Url);
+                if (db1Host == null || targetHost == null) {
+                    log.warn("--server-side requires both DB1 and target to be MySQL. Falling back to standard mode.");
+                } else if (!db1Host.equalsIgnoreCase(targetHost)) {
+                    log.warn("--server-side: DB1 ({}) and target ({}) are on different servers. Falling back to standard mode.", db1Host, targetHost);
+                } else if (!testCrossDbAccess(target, db1Schema)) {
+                    log.warn("--server-side: target connection cannot SELECT from {}. Falling back to standard mode.", db1Schema);
                 } else {
-                    log.info("[Merge  1/17] Creating target schema...");
+                    useServerSide = true;
+                    log.info("*** SERVER-SIDE MODE: DB1 tables will be transferred via INSERT INTO...SELECT (server: {}) ***", db1Host);
+                }
+            }
+
+            // Validate first
+            log.info("[Merge] Running pre-merge validation...");
+            MergePlan plan = buildPlan(conn1, conn2, db1Url, db2Url, targetUrl, target);
+            if (!plan.canProceed()) {
+                plan.printReport();
+                throw new RuntimeException("Pre-merge validation failed. See errors above.");
+            }
+            log.info("[Merge] Pre-merge validation passed.");
+
+            // Set DB names for name prefixing
+            db1Name = dbNameFromUrl(db1Url);
+            db2Name = dbNameFromUrl(db2Url);
+
+            // Compute duplicate cocktail name sets for name prefixing during merge
+            log.info("[Merge] Computing cocktail duplicate names...");
+            computeCocktailDupNames(conn1, conn2);
+
+            // Compute plate/location duplicate skip sets
+            log.info("[Merge] Computing plate/location duplicate skip IDs...");
+            computePlateLocationSkipIds(conn1, conn2);
+
+            // Load completed steps if resuming
+            Set<String> completedSteps = new HashSet<>();
+            if (resume) {
+                completedSteps = loadCompletedSteps(target);
+                if (completedSteps.isEmpty()) {
+                    log.info("[Merge] No previous progress found — starting fresh.");
+                } else {
+                    log.info("[Merge] Resuming merge. Completed steps: {}", completedSteps);
+                }
+            }
+
+            // Step 1: Schema
+            if (!completedSteps.contains("schema")) {
+                if (skipSchema) {
+                    log.info("[Merge  1/18] Skipping schema creation (--skip-schema)");
+                } else {
+                    log.info("[Merge  1/18] Creating target schema...");
                     createTargetSchema(target, targetUrl);
                 }
+                ensureProgressTable(target, targetUrl);
+                if (!resume && !skipSchema) {
+                    // Fresh run — no truncation needed, tables just created
+                } else if (!resume && skipSchema) {
+                    // Fresh run with skip-schema — truncate existing data
+                    log.info("[Merge] Truncating existing target tables...");
+                    truncateTargetTables(target, targetUrl);
+                }
+                // For resume: skip-schema tables already exist, no truncation
+                recordStep(target, "schema");
+                target.commit();
+            } else {
+                log.info("[Merge  1/18] Schema — already done, skipping.");
+                ensureProgressTable(target, targetUrl);
+            }
 
-                // Phase 1: Version and properties
-                log.info("[Merge  2/17] Merging version and properties...");
+            // Step 2: Version and properties
+            if (!completedSteps.contains("version_properties")) {
+                log.info("[Merge  2/18] Merging version and properties...");
                 mergeVersionAndProperties(conn1, conn2, target);
+                recordStep(target, "version_properties");
+                target.commit();
+            } else {
+                log.info("[Merge  2/18] version_properties — already done, skipping.");
+            }
 
-                // Phase 2: Cocktail deduplication
-                log.info("[Merge  3/17] Merging cyclesequencing_cocktail (with dedup)...");
+            // Step 3: CS cocktails
+            if (!completedSteps.contains("cs_cocktail")) {
+                log.info("[Merge  3/18] Merging cyclesequencing_cocktail (with dedup)...");
                 mergeCsCocktails(conn1, conn2, target);
-                log.info("[Merge  4/17] Merging pcr_cocktail (with dedup)...");
+                recordStep(target, "cs_cocktail");
+                target.commit();
+            } else {
+                log.info("[Merge  3/18] cs_cocktail — already done, skipping.");
+                // Need to rebuild cscocktailMap from target for subsequent steps
+                rebuildCsCocktailMap(conn1, conn2, target);
+            }
+
+            // Step 4: PCR cocktails
+            if (!completedSteps.contains("pcr_cocktail")) {
+                log.info("[Merge  4/18] Merging pcr_cocktail (with dedup)...");
                 mergePcrCocktails(conn1, conn2, target);
+                recordStep(target, "pcr_cocktail");
+                target.commit();
+            } else {
+                log.info("[Merge  4/18] pcr_cocktail — already done, skipping.");
+                rebuildPcrCocktailMap(conn1, conn2, target);
+            }
 
-                // Phase 3: Thermocycle hierarchy deduplication
-                log.info("[Merge  5/17] Merging thermocycle hierarchy (with dedup)...");
+            // Step 5: Thermocycle hierarchy
+            if (!completedSteps.contains("thermocycle")) {
+                log.info("[Merge  5/18] Merging thermocycle hierarchy (with dedup)...");
                 mergeThermocycleHierarchy(conn1, conn2, target);
+                recordStep(target, "thermocycle");
+                target.commit();
+            } else {
+                log.info("[Merge  5/18] thermocycle — already done, skipping.");
+                rebuildThermocycleMap(conn1, conn2, target);
+            }
 
-                // Phase 4: Remaining tables in dependency order
-                log.info("[Merge  6/17] Merging failure_reason...");
+            // Steps 6-17: Table copies (each committed individually)
+            String[][] tableSteps = {
+                    {"6",  "failure_reason"},
+                    {"7",  "gelimages"},
+                    {"8",  "pcr_thermocycle"},
+                    {"9",  "cs_thermocycle"},
+                    {"10", "plate"},
+                    {"11", "extraction"},
+                    {"12", "workflow"},
+                    {"13", "gel_quantification"},
+                    {"14", "assembly"},
+                    {"15", "pcr"},
+                    {"16", "cyclesequencing"},
+                    {"17", "traces"},
+                    {"18", "sequencing_result"},
+            };
+
+            int maxRetries = 3;
+            int[] retryCounts = new int[tableSteps.length];
+
+            for (int si = 0; si < tableSteps.length; si++) {
+                String stepNum = tableSteps[si][0];
+                String stepName = tableSteps[si][1];
+                if (completedSteps.contains(stepName)) {
+                    log.info("[Merge {}/18] {} — already done, skipping.", stepNum, stepName);
+                    // Still need to populate db1MaxIds for offset calculations
+                    rebuildMaxIdForStep(conn1, stepName);
+                    continue;
+                }
+
+                log.info("[Merge {}/18] Merging {}...", stepNum, stepName);
+                try {
+                    long stepStart = System.currentTimeMillis();
+                    runTableStep(stepName, conn1, conn2, target);
+                    recordStep(target, stepName);
+                    target.commit();
+                    long elapsed = (System.currentTimeMillis() - stepStart) / 1000;
+                    log.info("[Merge {}/18] {} complete ({}m {}s)", stepNum, stepName, elapsed / 60, elapsed % 60);
+                } catch (SQLException e) {
+                    if (isConnectionError(e)) {
+                        log.warn("Step {} hit a connection error: {}", stepName, e.getMessage());
+                        log.info("Attempting to recover — reconnecting and checking if data was committed...");
+                        // Reconnect all three connections
+                        conn1 = reconnect(conn1, db1Url, db1Username, db1Password, true);
+                        conn2 = reconnect(conn2, db2Url, db2Username, db2Password, true);
+                        target = reconnect(target, targetUrl, targetUsername, targetPassword, false);
+                        if (!isSQLite(targetUrl)) {
+                            target.createStatement().execute("SET FOREIGN_KEY_CHECKS = 0");
+                        }
+                        // Check if the step actually completed (data is in target)
+                        if (isStepDataPresent(target, stepName, conn1, conn2)) {
+                            log.info("Step {} data verified in target — recording as complete and continuing.", stepName);
+                            ensureProgressTable(target, targetUrl);
+                            recordStep(target, stepName);
+                            target.commit();
+                            // Rebuild maxId for this step so subsequent offsets are correct
+                            rebuildMaxIdForStep(conn1, stepName);
+                        } else {
+                            retryCounts[si]++;
+                            if (retryCounts[si] > maxRetries) {
+                                log.error("Step {} failed after {} retries. Run with --resume to continue later.", stepName, maxRetries);
+                                throw e;
+                            }
+                            log.warn("Step {} data incomplete — auto-resuming (attempt {}/{}).", stepName, retryCounts[si], maxRetries);
+                            si--; // rewind to retry this step
+                        }
+                    } else {
+                        log.error("Step {} failed (non-connection error). Run with --resume to continue from here.", stepName, e);
+                        try { target.rollback(); } catch (SQLException re) { log.error("Rollback failed", re); }
+                        throw e;
+                    }
+                } catch (Exception e) {
+                    log.error("Step {} failed. Run with --resume to continue from here.", stepName, e);
+                    try { target.rollback(); } catch (SQLException re) { log.error("Rollback failed", re); }
+                    throw e;
+                }
+            }
+
+            // Clean up progress table
+            cleanupProgressTable(target, targetUrl);
+            target.commit();
+
+            // Re-enable FK checks
+            if (!isSQLite(targetUrl)) {
+                target.createStatement().execute("SET FOREIGN_KEY_CHECKS = 1");
+                log.info("Re-enabled MySQL foreign key checks.");
+            }
+
+            log.info("[Merge] Merge completed successfully! All changes committed.");
+        } finally {
+            closeQuietly(conn1);
+            closeQuietly(conn2);
+            closeQuietly(target);
+        }
+    }
+
+    private static void closeQuietly(Connection conn) {
+        if (conn != null) {
+            try { conn.close(); } catch (SQLException ignored) {}
+        }
+    }
+
+    /**
+     * Check if a SQLException (or its cause chain) is a connection/communications error.
+     */
+    private boolean isConnectionError(SQLException e) {
+        Throwable t = e;
+        while (t != null) {
+            String msg = t.getMessage();
+            String className = t.getClass().getName();
+            if (msg != null && (msg.contains("Communications link failure") ||
+                    msg.contains("connection") && msg.contains("closed") ||
+                    msg.contains("Socket") && msg.contains("timeout") ||
+                    msg.contains("No operations allowed after connection closed"))) {
+                return true;
+            }
+            if (className.contains("CommunicationsException") ||
+                    className.contains("ConnectionIsClosedException")) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * Close an existing connection (ignoring errors) and open a fresh one.
+     */
+    private Connection reconnect(Connection old, String url, String username, String password, boolean autoCommit) throws SQLException {
+        closeQuietly(old);
+        Connection conn = connect(url, username, password);
+        conn.setAutoCommit(autoCommit);
+        log.info("  Reconnected to {}", dbNameFromUrl(url));
+        return conn;
+    }
+
+    /**
+     * Verify that a step's data is present in the target by checking row counts.
+     * Used after a connection error to determine if the step actually completed
+     * before the error (e.g. error on ResultSet close after all data committed).
+     */
+    private boolean isStepDataPresent(Connection target, String stepName,
+                                       Connection conn1, Connection conn2) {
+        try {
+            String tableName = stepNameToTable(stepName);
+            if (tableName == null) return false;
+
+            long sourceTotal = countRows(conn1, tableName) + countRows(conn2, tableName);
+            long targetTotal = countRows(target, tableName);
+
+            // Account for dedup skips: target may have fewer rows than source.
+            // If target has at least as many as DB1, and at least 90% of total,
+            // consider it done (exact match unlikely due to dedup).
+            long db1Total = countRows(conn1, tableName);
+            if (targetTotal >= db1Total && targetTotal >= sourceTotal * 0.9) {
+                log.info("  Step {} data check: target has {} rows (source total: {}) — looks complete",
+                        stepName, targetTotal, sourceTotal);
+                return true;
+            }
+            log.warn("  Step {} data check: target has {} rows but source has {} — incomplete",
+                    stepName, targetTotal, sourceTotal);
+            return false;
+        } catch (SQLException e) {
+            log.warn("  Could not verify step {} data: {}", stepName, e.getMessage());
+            return false;
+        }
+    }
+
+    private String stepNameToTable(String stepName) {
+        switch (stepName) {
+            case "failure_reason": return "failure_reason";
+            case "gelimages": return "gelimages";
+            case "pcr_thermocycle": return "pcr_thermocycle";
+            case "cs_thermocycle": return "cyclesequencing_thermocycle";
+            case "plate": return "plate";
+            case "extraction": return "extraction";
+            case "workflow": return "workflow";
+            case "gel_quantification": return "gel_quantification";
+            case "assembly": return "assembly";
+            case "pcr": return "pcr";
+            case "cyclesequencing": return "cyclesequencing";
+            case "traces": return "traces";
+            case "sequencing_result": return "sequencing_result";
+            default: return null;
+        }
+    }
+
+    /**
+     * Route a table step name to its merge method.
+     */
+    private void runTableStep(String stepName, Connection conn1, Connection conn2, Connection target) throws SQLException {
+        switch (stepName) {
+            case "failure_reason":
                 mergeSimpleTable(conn1, conn2, target, "failure_reason",
                         "id, name, description",
                         "INSERT INTO failure_reason (id, name, description) VALUES (?, ?, ?)",
                         new String[]{"name", "description"}, new int[]{}, new int[]{});
-
-                log.info("[Merge  7/17] Merging gelimages...");
+                break;
+            case "gelimages":
                 mergeGelimages(conn1, conn2, target);
-
-                log.info("[Merge  8/17] Merging pcr_thermocycle...");
+                break;
+            case "pcr_thermocycle":
                 mergeSimpleTable(conn1, conn2, target, "pcr_thermocycle",
                         "id, cycle",
                         "INSERT INTO pcr_thermocycle (id, cycle) VALUES (?, ?)",
                         new String[]{"cycle"}, new int[]{}, new int[]{1});
-
-                log.info("[Merge  9/17] Merging cyclesequencing_thermocycle...");
+                break;
+            case "cs_thermocycle":
                 mergeSimpleTable(conn1, conn2, target, "cyclesequencing_thermocycle",
                         "id, cycle",
                         "INSERT INTO cyclesequencing_thermocycle (id, cycle) VALUES (?, ?)",
                         new String[]{"cycle"}, new int[]{}, new int[]{1});
-
-                log.info("[Merge 10/17] Merging plate...");
+                break;
+            case "plate":
                 mergePlate(conn1, conn2, target);
-                log.info("[Merge 11/17] Merging extraction...");
+                break;
+            case "extraction":
                 mergeExtraction(conn1, conn2, target);
-                log.info("[Merge 12/17] Merging workflow...");
+                break;
+            case "workflow":
                 mergeWorkflow(conn1, conn2, target);
-
-                log.info("[Merge 13/17] Merging gel_quantification...");
+                break;
+            case "gel_quantification":
                 mergeGelQuantification(conn1, conn2, target);
-                log.info("[Merge 14/17] Merging assembly...");
+                break;
+            case "assembly":
                 mergeAssembly(conn1, conn2, target);
-                log.info("[Merge 15/17] Merging pcr...");
+                break;
+            case "pcr":
                 mergePcr(conn1, conn2, target);
-                log.info("[Merge 16/17] Merging cyclesequencing...");
+                break;
+            case "cyclesequencing":
                 mergeCyclesequencing(conn1, conn2, target);
-
-                log.info("[Merge 17/17] Merging traces and sequencing_result...");
+                break;
+            case "traces":
                 mergeTraces(conn1, conn2, target);
+                break;
+            case "sequencing_result":
                 mergeSequencingResult(conn1, conn2, target);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown step: " + stepName);
+        }
+    }
 
-                log.info("[Merge] Committing transaction...");
-                target.commit();
-                log.info("[Merge] Merge completed successfully! All changes committed.");
+    /**
+     * Rebuild db1MaxIds for a previously completed step so offsets are correct.
+     */
+    private void rebuildMaxIdForStep(Connection conn1, String stepName) throws SQLException {
+        switch (stepName) {
+            case "failure_reason":
+                db1MaxIds.put("failure_reason", maxId(conn1, "failure_reason"));
+                break;
+            case "gelimages":
+                db1MaxIds.put("gelimages", maxId(conn1, "gelimages"));
+                break;
+            case "pcr_thermocycle":
+                db1MaxIds.put("pcr_thermocycle", maxId(conn1, "pcr_thermocycle"));
+                break;
+            case "cs_thermocycle":
+                db1MaxIds.put("cyclesequencing_thermocycle", maxId(conn1, "cyclesequencing_thermocycle"));
+                break;
+            case "plate":
+                db1MaxIds.put("plate", maxId(conn1, "plate"));
+                break;
+            case "extraction":
+                db1MaxIds.put("extraction", maxId(conn1, "extraction"));
+                break;
+            case "workflow":
+                db1MaxIds.put("workflow", maxId(conn1, "workflow"));
+                break;
+            case "gel_quantification":
+                db1MaxIds.put("gel_quantification", maxId(conn1, "gel_quantification"));
+                break;
+            case "assembly":
+                db1MaxIds.put("assembly", maxId(conn1, "assembly"));
+                break;
+            case "pcr":
+                db1MaxIds.put("pcr", maxId(conn1, "pcr"));
+                break;
+            case "cyclesequencing":
+                db1MaxIds.put("cyclesequencing", maxId(conn1, "cyclesequencing"));
+                break;
+            case "traces":
+                db1MaxIds.put("traces", maxId(conn1, "traces"));
+                break;
+            case "sequencing_result":
+                // No id-based offset needed for sequencing_result
+                break;
+        }
+    }
 
-            } catch (Exception e) {
-                log.error("Merge failed, rolling back...", e);
-                try { target.rollback(); } catch (SQLException re) { log.error("Rollback failed", re); }
-                throw e;
+    // ─── Progress table helpers ──────────────────────────────────────
+
+    private void ensureProgressTable(Connection target, String targetUrl) throws SQLException {
+        try (Statement stmt = target.createStatement()) {
+            stmt.execute("CREATE TABLE IF NOT EXISTS _merge_progress (step VARCHAR(64) PRIMARY KEY, completed_at " +
+                    (isSQLite(targetUrl) ? "TIMESTAMP DEFAULT CURRENT_TIMESTAMP" : "DATETIME DEFAULT CURRENT_TIMESTAMP") + ")");
+        }
+    }
+
+    private Set<String> loadCompletedSteps(Connection target) {
+        Set<String> steps = new HashSet<>();
+        try (Statement stmt = target.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT step FROM _merge_progress")) {
+            while (rs.next()) {
+                steps.add(rs.getString("step"));
+            }
+        } catch (SQLException e) {
+            // Table doesn't exist yet — no steps completed
+            log.debug("No progress table found: {}", e.getMessage());
+        }
+        return steps;
+    }
+
+    private void recordStep(Connection target, String stepName) throws SQLException {
+        try (PreparedStatement ps = target.prepareStatement(
+                "INSERT INTO _merge_progress (step) VALUES (?)")) {
+            ps.setString(1, stepName);
+            ps.executeUpdate();
+        }
+    }
+
+    private void cleanupProgressTable(Connection target, String targetUrl) throws SQLException {
+        try (Statement stmt = target.createStatement()) {
+            if (isSQLite(targetUrl)) {
+                stmt.execute("DROP TABLE IF EXISTS _merge_progress");
+            } else {
+                try {
+                    stmt.execute("DROP TABLE _merge_progress");
+                } catch (SQLException ignored) {}
             }
         }
+    }
+
+    /**
+     * Rebuild cscocktailMap from already-merged data when resuming.
+     * Matches DB2 cocktail rows to target rows to reconstruct the id mapping.
+     */
+    private void rebuildCsCocktailMap(Connection conn1, Connection conn2, Connection target) throws SQLException {
+        String cols = "id, name, ddh2o, buffer, bigDye, notes, bufferConc, bigDyeConc, templateConc, " +
+                "primerConc, primerAmount, extraItem, extraItemAmount, templateAmount";
+        String compCols = "name, ddh2o, buffer, bigDye, notes, bufferConc, bigDyeConc, templateConc, " +
+                "primerConc, primerAmount, extraItem, extraItemAmount, templateAmount";
+        List<Map<String, Object>> db2Rows = fetchAllRows(conn2, "SELECT " + cols + " FROM cyclesequencing_cocktail ORDER BY id");
+        List<Map<String, Object>> targetRows = fetchAllRows(target, "SELECT " + cols + " FROM cyclesequencing_cocktail ORDER BY id");
+        for (Map<String, Object> db2Row : db2Rows) {
+            int db2Id = ((Number) db2Row.get("id")).intValue();
+            Map<String, Object> db2Comp = extractCompFields(db2Row, compCols.split(",\\s*"));
+            for (Map<String, Object> tRow : targetRows) {
+                Map<String, Object> tComp = extractCompFields(tRow, compCols.split(",\\s*"));
+                if (rowsEqual(db2Comp, tComp)) {
+                    cscocktailMap.put(db2Id, ((Number) tRow.get("id")).intValue());
+                    break;
+                }
+            }
+        }
+        log.debug("Rebuilt cscocktailMap with {} entries", cscocktailMap.size());
+    }
+
+    /**
+     * Rebuild pcrCocktailMap from already-merged data when resuming.
+     */
+    private void rebuildPcrCocktailMap(Connection conn1, Connection conn2, Connection target) throws SQLException {
+        String cols = "id, name, ddH20, buffer, mg, bsa, dNTP, taq, notes, bufferConc, " +
+                "mgConc, dNTPConc, taqConc, templateConc, bsaConc, fwPrAmount, fwPrConc, " +
+                "revPrAmount, revPrConc, extraItem, extraItemAmount, templateAmount";
+        String compCols = "name, ddH20, buffer, mg, bsa, dNTP, taq, notes, bufferConc, " +
+                "mgConc, dNTPConc, taqConc, templateConc, bsaConc, fwPrAmount, fwPrConc, " +
+                "revPrAmount, revPrConc, extraItem, extraItemAmount, templateAmount";
+        List<Map<String, Object>> db2Rows = fetchAllRows(conn2, "SELECT " + cols + " FROM pcr_cocktail ORDER BY id");
+        List<Map<String, Object>> targetRows = fetchAllRows(target, "SELECT " + cols + " FROM pcr_cocktail ORDER BY id");
+        for (Map<String, Object> db2Row : db2Rows) {
+            int db2Id = ((Number) db2Row.get("id")).intValue();
+            Map<String, Object> db2Comp = extractCompFields(db2Row, compCols.split(",\\s*"));
+            for (Map<String, Object> tRow : targetRows) {
+                Map<String, Object> tComp = extractCompFields(tRow, compCols.split(",\\s*"));
+                if (rowsEqual(db2Comp, tComp)) {
+                    pcrCocktailMap.put(db2Id, ((Number) tRow.get("id")).intValue());
+                    break;
+                }
+            }
+        }
+        log.debug("Rebuilt pcrCocktailMap with {} entries", pcrCocktailMap.size());
+    }
+
+    /**
+     * Rebuild thermocycleMap from already-merged data when resuming.
+     * Uses the same hierarchy comparison as the original merge.
+     */
+    private void rebuildThermocycleMap(Connection conn1, Connection conn2, Connection target) throws SQLException {
+        List<ThermocycleHierarchy> db2Hierarchies = loadThermocycleHierarchies(conn2);
+        List<ThermocycleHierarchy> targetHierarchies = loadThermocycleHierarchies(target);
+        for (ThermocycleHierarchy db2Th : db2Hierarchies) {
+            for (ThermocycleHierarchy tTh : targetHierarchies) {
+                if (db2Th.structurallyEquals(tTh)) {
+                    thermocycleMap.put(db2Th.thermocycleId, tTh.thermocycleId);
+                    // Also rebuild cycle and state maps
+                    for (int ci = 0; ci < db2Th.cycles.size() && ci < tTh.cycles.size(); ci++) {
+                        cycleMap.put(db2Th.cycles.get(ci).cycleId, tTh.cycles.get(ci).cycleId);
+                        for (int si = 0; si < db2Th.cycles.get(ci).states.size() &&
+                                si < tTh.cycles.get(ci).states.size(); si++) {
+                            stateMap.put(db2Th.cycles.get(ci).states.get(si).stateId,
+                                    tTh.cycles.get(ci).states.get(si).stateId);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        log.debug("Rebuilt thermocycleMap with {} entries", thermocycleMap.size());
     }
 
     // ─── Compute duplicate cocktail names for prefixing ──────────────
@@ -1918,15 +2697,23 @@ public class DatabaseMerger {
             }
         }
 
-        try (PreparedStatement ps = target.prepareStatement(insertSql)) {
-            for (Map<String, Object> row : db1Rows) {
-                prefixDupName(row, namesNeedingPrefix, db1Name);
-                setRowParams(ps, row, cols.split(",\\s*"));
-                ps.addBatch();
+        if (useServerSide) {
+            long ssCount = serverSideCopyDb1(target, db1Schema, "cyclesequencing_cocktail", cols, null);
+            log.info("  Copied {} rows from DB1 (server-side)", ssCount);
+            if (!namesNeedingPrefix.isEmpty()) {
+                serverSidePrefixNames(target, "cyclesequencing_cocktail", namesNeedingPrefix, db1Name);
             }
-            ps.executeBatch();
+        } else {
+            try (PreparedStatement ps = target.prepareStatement(insertSql)) {
+                for (Map<String, Object> row : db1Rows) {
+                    prefixDupName(row, namesNeedingPrefix, db1Name);
+                    setRowParams(ps, row, cols.split(",\\s*"));
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            log.info("  Copied {} rows from DB1", db1Rows.size());
         }
-        log.info("  Copied {} rows from DB1", db1Rows.size());
 
         // Get target comparison data (with prefixed names already applied)
         List<Map<String, Object>> targetCompRows = fetchAllRows(target, "SELECT id, " + compCols + " FROM cyclesequencing_cocktail ORDER BY id");
@@ -2038,15 +2825,23 @@ public class DatabaseMerger {
         }
 
         // Copy all from DB1, prefixing only names that need it
-        try (PreparedStatement ps = target.prepareStatement(insertSql)) {
-            for (Map<String, Object> row : db1Rows) {
-                prefixDupName(row, namesNeedingPrefix, db1Name);
-                setRowParams(ps, row, cols.split(",\\s*"));
-                ps.addBatch();
+        if (useServerSide) {
+            long ssCount = serverSideCopyDb1(target, db1Schema, "pcr_cocktail", cols, null);
+            log.info("  Copied {} rows from DB1 (server-side)", ssCount);
+            if (!namesNeedingPrefix.isEmpty()) {
+                serverSidePrefixNames(target, "pcr_cocktail", namesNeedingPrefix, db1Name);
             }
-            ps.executeBatch();
+        } else {
+            try (PreparedStatement ps = target.prepareStatement(insertSql)) {
+                for (Map<String, Object> row : db1Rows) {
+                    prefixDupName(row, namesNeedingPrefix, db1Name);
+                    setRowParams(ps, row, cols.split(",\\s*"));
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            log.info("  Copied {} rows from DB1", db1Rows.size());
         }
-        log.info("  Copied {} rows from DB1", db1Rows.size());
 
         // Get target comparison data (with prefixed names already applied)
         List<Map<String, Object>> targetCompRows = fetchAllRows(target, "SELECT id, " + compCols + " FROM pcr_cocktail ORDER BY id");
@@ -2119,30 +2914,37 @@ public class DatabaseMerger {
         List<ThermocycleHierarchy> h2 = loadThermocycleHierarchies(conn2);
 
         // Copy all from DB1 to target (preserve IDs)
-        for (ThermocycleHierarchy th : h1) {
-            try (PreparedStatement ps = target.prepareStatement(
-                    "INSERT INTO thermocycle (id, name, notes) VALUES (?, ?, ?)")) {
-                ps.setInt(1, th.thermocycleId);
-                ps.setString(2, th.name);
-                ps.setString(3, th.notes);
-                ps.executeUpdate();
-            }
-            for (CycleData cd : th.cycles) {
+        if (useServerSide) {
+            serverSideCopyDb1(target, db1Schema, "thermocycle", "id, name, notes", null);
+            serverSideCopyDb1(target, db1Schema, "cycle", "id, thermocycleId, repeats", null);
+            serverSideCopyDb1(target, db1Schema, "state", "id, temp, length, cycleId", null);
+            log.info("  Copied DB1 thermocycle hierarchy (server-side)");
+        } else {
+            for (ThermocycleHierarchy th : h1) {
                 try (PreparedStatement ps = target.prepareStatement(
-                        "INSERT INTO cycle (id, thermocycleId, repeats) VALUES (?, ?, ?)")) {
-                    ps.setInt(1, cd.cycleId);
-                    ps.setInt(2, th.thermocycleId);
-                    ps.setInt(3, cd.repeats);
+                        "INSERT INTO thermocycle (id, name, notes) VALUES (?, ?, ?)")) {
+                    ps.setInt(1, th.thermocycleId);
+                    ps.setString(2, th.name);
+                    ps.setString(3, th.notes);
                     ps.executeUpdate();
                 }
-                for (StateData sd : cd.states) {
+                for (CycleData cd : th.cycles) {
                     try (PreparedStatement ps = target.prepareStatement(
-                            "INSERT INTO state (id, temp, length, cycleId) VALUES (?, ?, ?, ?)")) {
-                        ps.setInt(1, sd.stateId);
-                        ps.setInt(2, sd.temp);
-                        ps.setInt(3, sd.length);
-                        ps.setInt(4, cd.cycleId);
+                            "INSERT INTO cycle (id, thermocycleId, repeats) VALUES (?, ?, ?)")) {
+                        ps.setInt(1, cd.cycleId);
+                        ps.setInt(2, th.thermocycleId);
+                        ps.setInt(3, cd.repeats);
                         ps.executeUpdate();
+                    }
+                    for (StateData sd : cd.states) {
+                        try (PreparedStatement ps = target.prepareStatement(
+                                "INSERT INTO state (id, temp, length, cycleId) VALUES (?, ?, ?, ?)")) {
+                            ps.setInt(1, sd.stateId);
+                            ps.setInt(2, sd.temp);
+                            ps.setInt(3, sd.length);
+                            ps.setInt(4, cd.cycleId);
+                            ps.executeUpdate();
+                        }
                     }
                 }
             }
@@ -2268,10 +3070,16 @@ public class DatabaseMerger {
         long db1MaxId = maxId(conn1, tableName);
         db1MaxIds.put(tableName, db1MaxId);
 
-        // Stream DB1
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
-                target, insertSql, colNames, null);
-        log.info("  Copied {} rows from DB1 (maxId={})", db1Count, db1MaxId);
+        // Stream DB1 (server-side if eligible — no transform needed for DB1)
+        long db1Count;
+        if (useServerSide) {
+            db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, null);
+            log.info("  Copied {} rows from DB1 (server-side, maxId={})", db1Count, db1MaxId);
+        } else {
+            db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                    target, insertSql, colNames, null);
+            log.info("  Copied {} rows from DB1 (maxId={})", db1Count, db1MaxId);
+        }
 
         // Stream DB2 with offset and FK mapping
         final long offset = db1MaxId;
@@ -2303,18 +3111,14 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "gelimages");
         db1MaxIds.put("gelimages", db1MaxId);
-
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM gelimages ORDER BY id"),
-                target, insertSql, colNames, null);
         final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM gelimages ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        resumableCopy(conn1, conn2, target, "gelimages", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "plate", plateOffset);
                 });
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }
 
     private void mergePlate(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -2327,8 +3131,14 @@ public class DatabaseMerger {
         long db1MaxId = maxId(conn1, "plate");
         db1MaxIds.put("plate", db1MaxId);
 
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
-                target, insertSql, colNames, null);
+        long db1Count;
+        if (useServerSide) {
+            db1Count = serverSideCopyDb1(target, db1Schema, "plate", cols, null);
+            log.info("  Copied {} rows from DB1 (server-side)", db1Count);
+        } else {
+            db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
+                    target, insertSql, colNames, null);
+        }
 
         long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM plate ORDER BY id"),
                 target, insertSql, colNames, row -> {
@@ -2359,18 +3169,15 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "extraction");
         db1MaxIds.put("extraction", db1MaxId);
-
-        long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM extraction ORDER BY id"),
-                target, insertSql, colNames, null, extractionSkipIds);
         final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM extraction ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        resumableCopyWithSkip(conn1, conn2, target, "extraction", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "plate", plateOffset);
-                }, extractionSkipIds);
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+                },
+                extractionSkipIds);
     }
 
     private void mergeWorkflow(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -2385,13 +3192,11 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "workflow");
         db1MaxIds.put("workflow", db1MaxId);
-
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM workflow ORDER BY id"),
-                target, insertSql, colNames, null);
         final long extractionOffset = db1MaxIds.getOrDefault("extraction", 0L);
 
-        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM workflow ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        resumableCopy(conn1, conn2, target, "workflow", cols, insertSql, colNames,
+                null,
+                row -> {
                     int origId = ((Number) row.get("id")).intValue();
                     row.put("id", (int) (origId + db1MaxId));
                     applyOffset(row, "extractionid", extractionOffset);
@@ -2410,8 +3215,6 @@ public class DatabaseMerger {
                         }
                     }
                 });
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }
 
     private void mergeGelQuantification(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -2486,14 +3289,12 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "pcr");
         db1MaxIds.put("pcr", db1MaxId);
-
-        long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM pcr ORDER BY id"),
-                target, insertSql, colNames, null, pcrSkipIds);
         final long workflowOffset = db1MaxIds.getOrDefault("workflow", 0L);
         final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM pcr ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        resumableCopyWithSkip(conn1, conn2, target, "pcr", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "workflow", workflowOffset);
                     applyOffset(row, "plate", plateOffset);
@@ -2505,9 +3306,8 @@ public class DatabaseMerger {
                             row.put("thermocycle", thermocycleMap.get(tcId));
                         }
                     }
-                }, pcrSkipIds);
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+                },
+                pcrSkipIds);
     }
 
     private void mergeCyclesequencing(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -2522,14 +3322,12 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "cyclesequencing");
         db1MaxIds.put("cyclesequencing", db1MaxId);
-
-        long db1Count = streamingCopyWithSkip(conn1, limitSql("SELECT " + cols + " FROM cyclesequencing ORDER BY id"),
-                target, insertSql, colNames, null, csSkipIds);
         final long workflowOffset = db1MaxIds.getOrDefault("workflow", 0L);
         final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopyWithSkip(conn2, limitSql("SELECT " + cols + " FROM cyclesequencing ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        resumableCopyWithSkip(conn1, conn2, target, "cyclesequencing", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "workflow", workflowOffset);
                     applyOffset(row, "plate", plateOffset);
@@ -2541,9 +3339,8 @@ public class DatabaseMerger {
                             row.put("thermocycle", thermocycleMap.get(tcId));
                         }
                     }
-                }, csSkipIds);
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+                },
+                csSkipIds);
     }
 
     private void mergeTraces(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -2555,18 +3352,14 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "traces");
         db1MaxIds.put("traces", db1MaxId);
-
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM traces ORDER BY id"),
-                target, insertSql, colNames, null);
         final long csOffset = db1MaxIds.getOrDefault("cyclesequencing", 0L);
 
-        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM traces ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        resumableCopy(conn1, conn2, target, "traces", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "reaction", csOffset);
                 });
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }
 
     private void mergeSequencingResult(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -2576,8 +3369,14 @@ public class DatabaseMerger {
         String insertSql = "INSERT INTO sequencing_result (reaction, assembly) VALUES (?, ?)";
         String[] colNames = cols.split(",\\s*");
 
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM sequencing_result"),
-                target, insertSql, colNames, null);
+        long db1Count;
+        if (useServerSide) {
+            db1Count = serverSideCopyDb1(target, db1Schema, "sequencing_result", cols, null);
+            log.info("  Copied {} rows from DB1 (server-side)", db1Count);
+        } else {
+            db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM sequencing_result"),
+                    target, insertSql, colNames, null);
+        }
         final long csOffset = db1MaxIds.getOrDefault("cyclesequencing", 0L);
         final long assemblyOffset = db1MaxIds.getOrDefault("assembly", 0L);
 

@@ -176,6 +176,9 @@ gradle merge -PskipSchema
 # Test mode (copy only 10 rows per tier 1+ table)
 gradle merge -PtestMode
 
+# Resume an interrupted merge
+gradle merge -Presume
+
 # Combine flags
 gradle merge -PskipSchema -PtestMode
 ```
@@ -196,6 +199,7 @@ java -jar build/libs/db-merger-1.0.0-all.jar plan <db1-url> <db2-url> <target-ur
 # With flags
 java -jar build/libs/db-merger-1.0.0-all.jar merge --skip-schema
 java -jar build/libs/db-merger-1.0.0-all.jar merge --test
+java -jar build/libs/db-merger-1.0.0-all.jar merge --resume
 java -jar build/libs/db-merger-1.0.0-all.jar merge --skip-schema --test
 ```
 
@@ -205,12 +209,62 @@ java -jar build/libs/db-merger-1.0.0-all.jar merge --skip-schema --test
 |------|----------------------|-------------|
 | `--skip-schema` | `skip.schema=true` | Skip `CREATE TABLE` statements. Use when target tables already exist. |
 | `--test` | `test.mode=true` | Copy only 10 rows per table for tier 1 and above. Setup and dedup tables are copied in full to preserve FK integrity. |
+| `--resume` | `resume=true` | Resume a previously interrupted merge from where it left off. |
+| `--server-side` | `server.side=true` | Use `INSERT INTO...SELECT` for DB1 tables when DB1 and target are on the same MySQL server. |
+
+## Server-Side Transfer
+
+When DB1 and the target database are on the same MySQL server, `--server-side` tells the merger to use `INSERT INTO target.table SELECT ... FROM db1.table` for DB1 data. This keeps the data entirely within the MySQL server — no network transfer through the Java process — which is significantly faster for large tables.
+
+```bash
+gradle merge -PserverSide
+# or
+java -jar db-merger.jar merge --server-side
+```
+
+The merger automatically validates server-side mode at startup:
+1. Both DB1 and target must be MySQL (not SQLite)
+2. The host:port parsed from both JDBC URLs must match
+3. The target connection must have SELECT access to the DB1 database (tested with a probe query)
+
+If any check fails, it falls back to standard mode with a warning.
+
+**What uses server-side transfer:**
+- All DB1 table copies that don't require row transformation (failure_reason, gelimages, pcr_thermocycle, cyclesequencing_thermocycle, plate, extraction, workflow, gel_quantification, assembly, pcr, cyclesequencing, traces, sequencing_result)
+- For tables with plate/location dedup, `WHERE id NOT IN (...)` excludes the skip IDs server-side
+
+**What still goes through Java:**
+- All DB2 copies (need ID offset, FK remapping)
+- Cocktail and thermocycle dedup (need row-by-row comparison logic)
+- Version/properties merge (trivial, just a few rows)
+
+## Resumable Merges
+
+If a merge is interrupted (e.g. by a network dropout or crash), it can be resumed from where it left off using `--resume`. The merger tracks progress in a `_merge_progress` table in the target database, recording each completed step.
+
+```bash
+# First attempt (interrupted at step 11)
+java -jar db-merger.jar merge
+
+# Resume — steps 1-10 are skipped, continues from step 11
+java -jar db-merger.jar merge --resume
+```
+
+On resume, the merger:
+1. Loads completed steps from `_merge_progress` in the target
+2. Skips any step already recorded as complete
+3. Rebuilds in-memory mappings (cocktail dedup maps, thermocycle maps, max-ID offsets) from the data already present in the target, so subsequent steps produce correct foreign key references
+4. Each step commits independently — only the failed step is lost, not all prior work
+5. For large tables (`extraction`, `workflow`, `pcr`, `cyclesequencing`, `gelimages`, and `traces`), progress is committed after every batch of 100 rows. On resume, the merger checks the max ID already in the target and uses `WHERE id > maxTargetId` to read only uncopied rows from the source, so at most one batch of work is lost
+6. On successful completion, the `_merge_progress` table is dropped
+
+Without `--resume`, a fresh merge starts from scratch (and if `--skip-schema` is used, existing target data is truncated first).
 
 ## Progress Logging
 
 Plan mode logs progress as `[Plan  1/12]` through `[Plan 12/12]`.
 
-Merge mode logs as `[Merge  1/17]` through `[Merge 17/17]` for each table. During streaming copy, a progress message is logged every 1,000 rows. In test mode, a banner is printed at startup indicating the row limit.
+Merge mode logs as `[Merge  1/18]` through `[Merge 18/18]` for each table. During streaming copy, a progress message is logged every 1,000 rows. For resumable tables (`extraction`, `workflow`, `pcr`, `cyclesequencing`, `gelimages`, `traces`), progress is committed after each batch of 100 rows, and a commit message is logged every 1,000 rows. In test mode, a banner is printed at startup indicating the row limit.
 
 ## Performance Notes
 
