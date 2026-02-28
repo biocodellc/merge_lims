@@ -79,6 +79,7 @@ public class DatabaseMerger {
         boolean testMode = false;
         boolean resume = false;
         boolean serverSide = false;
+        boolean serverSideDb2 = false;
 
         // First arg is always the mode
         mode = args[0].toLowerCase();
@@ -96,6 +97,9 @@ public class DatabaseMerger {
             }
             if ("--server-side".equals(arg)) {
                 serverSide = true;
+            }
+            if ("--server-side-db2".equals(arg)) {
+                serverSideDb2 = true;
             }
         }
 
@@ -149,6 +153,10 @@ public class DatabaseMerger {
                 String serverSideProp = props.getProperty("server.side");
                 if ("true".equalsIgnoreCase(serverSideProp)) serverSide = true;
 
+                // Optional: server-side transfer for DB2
+                String serverSideDb2Prop = props.getProperty("server.side.db2");
+                if ("true".equalsIgnoreCase(serverSideDb2Prop)) serverSideDb2 = true;
+
                 log.info("Loaded configuration from {}", propsFile.getAbsolutePath());
             } catch (java.io.IOException e) {
                 log.warn("Failed to load properties file: {}", e.getMessage());
@@ -193,7 +201,7 @@ public class DatabaseMerger {
                     merger.runMerge(db1Url, db1Username, db1Password,
                                    db2Url, db2Username, db2Password,
                                    targetUrl, targetUsername, targetPassword,
-                                   skipSchema, testMode, resume, serverSide);
+                                   skipSchema, testMode, resume, serverSide, serverSideDb2);
                     break;
             }
         } catch (Exception e) {
@@ -240,6 +248,7 @@ public class DatabaseMerger {
         System.out.println("  --test          Test mode: copy only 10 rows per table (tier 1 and above)");
         System.out.println("  --resume        Resume a previously interrupted merge from where it left off");
         System.out.println("  --server-side   Use INSERT INTO...SELECT for DB1 tables when DB1 and target are on the same MySQL server");
+        System.out.println("  --server-side-db2  Use INSERT INTO...SELECT for DB2 tables with simple offsets (same server required)");
     }
 
     // ─── Connection helper ─────────────────────────────────────────────
@@ -311,9 +320,15 @@ public class DatabaseMerger {
         }
     }
 
+    /** Batch size for server-side INSERT INTO...SELECT to avoid filling temp disk */
+    private static final int SERVER_SIDE_BATCH = 20000;
+
     /**
      * Server-side INSERT INTO ... SELECT for a DB1 table. Data stays entirely within
      * the MySQL server — no transfer through the Java process.
+     *
+     * For tables with an id column, copies in batches of SERVER_SIDE_BATCH rows using
+     * WHERE id BETWEEN to avoid MySQL creating huge temp files for BLOB-heavy tables.
      *
      * @param target     target connection
      * @param db1Schema  DB1 schema/database name
@@ -325,23 +340,185 @@ public class DatabaseMerger {
     private long serverSideCopyDb1(Connection target, String db1Schema, String tableName,
                                     String cols, String whereClause) throws SQLException {
         String targetSchema = dbNameFromUrl(target.getMetaData().getURL());
-        // Check if table has an 'id' column (sequencing_result doesn't)
         boolean hasId = cols.toLowerCase().startsWith("id,") || cols.toLowerCase().startsWith("id ");
-        String sql = "INSERT INTO " + targetSchema + "." + tableName + " (" + cols + ") " +
-                "SELECT " + cols + " FROM " + db1Schema + "." + tableName +
-                (whereClause != null ? " " + whereClause : "") +
-                (hasId ? " ORDER BY id" : "") +
-                (testRowLimit > 0 ? " LIMIT " + testRowLimit : "");
-        log.debug("  Server-side SQL: {}", sql);
-        try (Statement stmt = target.createStatement()) {
-            long rows = stmt.executeUpdate(sql);
-            return rows;
+
+        if (!hasId) {
+            // No id column (e.g. sequencing_result) — single statement
+            String sql = "INSERT INTO " + targetSchema + "." + tableName + " (" + cols + ") " +
+                    "SELECT " + cols + " FROM " + db1Schema + "." + tableName +
+                    (whereClause != null ? " " + whereClause : "") +
+                    (testRowLimit > 0 ? " LIMIT " + testRowLimit : "");
+            log.debug("  Server-side SQL: {}", sql);
+            try (Statement stmt = target.createStatement()) {
+                return stmt.executeUpdate(sql);
+            }
         }
+
+        // Determine the ID range to copy
+        long minId = 0;
+        long maxIdVal = 0;
+        String rangeWhere = whereClause != null ? whereClause : "";
+        String rangeSql = "SELECT MIN(id), MAX(id) FROM " + db1Schema + "." + tableName +
+                (rangeWhere.isEmpty() ? "" : " " + rangeWhere);
+        try (Statement stmt = target.createStatement();
+             ResultSet rs = stmt.executeQuery(rangeSql)) {
+            if (rs.next()) {
+                minId = rs.getLong(1);
+                maxIdVal = rs.getLong(2);
+            }
+        }
+
+        if (maxIdVal == 0) {
+            log.info("  Server-side: no rows to copy from {}.{}", db1Schema, tableName);
+            return 0;
+        }
+
+        // Copy in batches by ID range
+        long totalRows = 0;
+        long batchLimit = testRowLimit > 0 ? testRowLimit : Long.MAX_VALUE;
+        for (long batchStart = minId; batchStart <= maxIdVal && totalRows < batchLimit; batchStart += SERVER_SIDE_BATCH) {
+            long batchEnd = Math.min(batchStart + SERVER_SIDE_BATCH - 1, maxIdVal);
+
+            // Build WHERE clause: combine id range with any existing where conditions
+            String batchWhere;
+            if (rangeWhere.isEmpty()) {
+                batchWhere = "WHERE id BETWEEN " + batchStart + " AND " + batchEnd;
+            } else if (rangeWhere.toUpperCase().startsWith("WHERE ")) {
+                batchWhere = "WHERE id BETWEEN " + batchStart + " AND " + batchEnd +
+                        " AND (" + rangeWhere.substring(6) + ")";
+            } else {
+                batchWhere = "WHERE id BETWEEN " + batchStart + " AND " + batchEnd +
+                        " AND (" + rangeWhere + ")";
+            }
+
+            String sql = "INSERT INTO " + targetSchema + "." + tableName + " (" + cols + ") " +
+                    "SELECT " + cols + " FROM " + db1Schema + "." + tableName +
+                    " " + batchWhere + " ORDER BY id";
+            if (testRowLimit > 0) {
+                long remaining = batchLimit - totalRows;
+                sql += " LIMIT " + remaining;
+            }
+
+            log.debug("  Server-side batch SQL: {}", sql);
+            try (Statement stmt = target.createStatement()) {
+                long rows = stmt.executeUpdate(sql);
+                totalRows += rows;
+                target.commit();
+            }
+
+            if (totalRows % (SERVER_SIDE_BATCH * 5) == 0 || batchEnd >= maxIdVal) {
+                log.info("    ... {} rows copied server-side (id range {}-{})", totalRows, minId, batchEnd);
+            }
+        }
+
+        return totalRows;
     }
 
     /**
-     * Server-side UPDATE to prefix duplicate cocktail names for DB1 rows already in the target.
+     * Server-side INSERT INTO...SELECT for a DB2 table with simple column offsets.
+     * Builds a SELECT expression that applies arithmetic offsets inline, e.g.:
+     *   INSERT INTO target.table (id, col1, fk1, fk2)
+     *   SELECT id + 1000, col1, fk1 + 500, fk2 + 300 FROM db2.table
+     *
+     * @param target       target connection
+     * @param db2Schema    DB2 schema/database name
+     * @param tableName    table to copy
+     * @param cols         column list (comma-separated)
+     * @param offsetMap    map of column name (lowercase) -> offset to apply
+     * @param whereClause  optional WHERE clause or null
+     * @return number of rows inserted
      */
+    private long serverSideCopyDb2(Connection target, String db2Schema, String tableName,
+                                    String cols, Map<String, Long> offsetMap,
+                                    String whereClause) throws SQLException {
+        String targetSchema = dbNameFromUrl(target.getMetaData().getURL());
+        String[] colArr = cols.split(",\\s*");
+        boolean hasId = colArr[0].trim().equalsIgnoreCase("id");
+
+        // Build SELECT expression list with offsets applied
+        StringBuilder selectExpr = new StringBuilder();
+        for (int i = 0; i < colArr.length; i++) {
+            if (i > 0) selectExpr.append(", ");
+            String col = colArr[i].trim();
+            String colLower = col.toLowerCase();
+            Long offset = offsetMap.get(colLower);
+            if (offset != null && offset != 0) {
+                // Apply offset, handling NULLs: IFNULL leaves NULL as NULL
+                selectExpr.append(col).append(" + ").append(offset);
+            } else {
+                selectExpr.append(col);
+            }
+        }
+
+        if (!hasId) {
+            // No id column — single statement
+            String sql = "INSERT INTO " + targetSchema + "." + tableName + " (" + cols + ") " +
+                    "SELECT " + selectExpr + " FROM " + db2Schema + "." + tableName +
+                    (whereClause != null ? " " + whereClause : "") +
+                    (testRowLimit > 0 ? " LIMIT " + testRowLimit : "");
+            log.debug("  Server-side DB2 SQL: {}", sql);
+            try (Statement stmt = target.createStatement()) {
+                return stmt.executeUpdate(sql);
+            }
+        }
+
+        // Batched copy by ID range
+        long minId = 0;
+        long maxIdVal = 0;
+        String rangeWhere = whereClause != null ? whereClause : "";
+        String rangeSql = "SELECT MIN(id), MAX(id) FROM " + db2Schema + "." + tableName +
+                (rangeWhere.isEmpty() ? "" : " " + rangeWhere);
+        try (Statement stmt = target.createStatement();
+             ResultSet rs = stmt.executeQuery(rangeSql)) {
+            if (rs.next()) {
+                minId = rs.getLong(1);
+                maxIdVal = rs.getLong(2);
+            }
+        }
+
+        if (maxIdVal == 0) {
+            log.info("  Server-side DB2: no rows to copy from {}.{}", db2Schema, tableName);
+            return 0;
+        }
+
+        long totalRows = 0;
+        long batchLimit = testRowLimit > 0 ? testRowLimit : Long.MAX_VALUE;
+        for (long batchStart = minId; batchStart <= maxIdVal && totalRows < batchLimit; batchStart += SERVER_SIDE_BATCH) {
+            long batchEnd = Math.min(batchStart + SERVER_SIDE_BATCH - 1, maxIdVal);
+
+            String batchWhere;
+            if (rangeWhere.isEmpty()) {
+                batchWhere = "WHERE id BETWEEN " + batchStart + " AND " + batchEnd;
+            } else if (rangeWhere.toUpperCase().startsWith("WHERE ")) {
+                batchWhere = "WHERE id BETWEEN " + batchStart + " AND " + batchEnd +
+                        " AND (" + rangeWhere.substring(6) + ")";
+            } else {
+                batchWhere = "WHERE id BETWEEN " + batchStart + " AND " + batchEnd +
+                        " AND (" + rangeWhere + ")";
+            }
+
+            String sql = "INSERT INTO " + targetSchema + "." + tableName + " (" + cols + ") " +
+                    "SELECT " + selectExpr + " FROM " + db2Schema + "." + tableName +
+                    " " + batchWhere + " ORDER BY id";
+            if (testRowLimit > 0) {
+                long remaining = batchLimit - totalRows;
+                sql += " LIMIT " + remaining;
+            }
+
+            log.debug("  Server-side DB2 batch SQL: {}", sql);
+            try (Statement stmt = target.createStatement()) {
+                long rows = stmt.executeUpdate(sql);
+                totalRows += rows;
+                target.commit();
+            }
+
+            if (totalRows % (SERVER_SIDE_BATCH * 5) == 0 || batchEnd >= maxIdVal) {
+                log.info("    ... {} rows copied server-side from DB2 (id range {}-{})", totalRows, minId, batchEnd);
+            }
+        }
+
+        return totalRows;
+    }
     private void serverSidePrefixNames(Connection target, String tableName, Set<String> dupNames, String prefix) throws SQLException {
         if (dupNames.isEmpty()) return;
         // Build WHERE name IN (...)
@@ -369,6 +546,8 @@ public class DatabaseMerger {
     // Instance flag: whether server-side transfer is active for this merge
     private boolean useServerSide = false;
     private String db1Schema = null;
+    private boolean useServerSideDb2 = false;
+    private String db2Schema = null;
 
     // Duplicate name sets computed during merge for cocktail name prefixing
     private final Set<String> csCocktailDupNames = new HashSet<>();
@@ -1809,6 +1988,68 @@ public class DatabaseMerger {
     }
 
     /**
+     * Overload of resumableCopy that supports server-side DB2 transfer for tables
+     * with simple offset-only transforms (no map lookups like cocktail/thermocycle).
+     *
+     * @param db2OffsetMap  map of column name (lowercase) -> offset value for DB2 server-side.
+     *                      Must include "id" -> db1MaxId.
+     */
+    private long resumableCopy(Connection conn1, Connection conn2, Connection target,
+                               String tableName, String cols, String insertSql, String[] colNames,
+                               RowTransformer db1Transform, RowTransformer db2Transform,
+                               Map<String, Long> db2OffsetMap) throws SQLException {
+        if (!useServerSideDb2 || db2OffsetMap == null) {
+            return resumableCopy(conn1, conn2, target, tableName, cols, insertSql, colNames,
+                    db1Transform, db2Transform);
+        }
+
+        long db1MaxIdVal = db1MaxIds.getOrDefault(tableName, 0L);
+        long targetMaxId = maxId(target, tableName);
+        boolean ssDb1 = useServerSide && db1Transform == null;
+
+        long db1Count = 0;
+        long db2Count = 0;
+
+        if (targetMaxId == 0) {
+            if (ssDb1) {
+                db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, null);
+                log.info("  Copied {} rows from DB1 (server-side)", db1Count);
+            } else {
+                db1Count = streamingCopyWithCommit(conn1,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " ORDER BY id"),
+                        target, insertSql, colNames, db1Transform);
+            }
+            db2Count = serverSideCopyDb2(target, db2Schema, tableName, cols, db2OffsetMap, null);
+            log.info("  Copied {} rows from DB2 (server-side)", db2Count);
+        } else if (targetMaxId < db1MaxIdVal) {
+            log.info("  Resuming DB1 from id > {} (target maxId={})", targetMaxId, targetMaxId);
+            if (ssDb1) {
+                db1Count = serverSideCopyDb1(target, db1Schema, tableName, cols, "WHERE id > " + targetMaxId);
+                log.info("  Copied {} rows from DB1 (server-side, resumed)", db1Count);
+            } else {
+                db1Count = streamingCopyWithCommit(conn1,
+                        limitSql("SELECT " + cols + " FROM " + tableName + " WHERE id > " + targetMaxId + " ORDER BY id"),
+                        target, insertSql, colNames, db1Transform);
+            }
+            db2Count = serverSideCopyDb2(target, db2Schema, tableName, cols, db2OffsetMap, null);
+            log.info("  Copied {} rows from DB2 (server-side)", db2Count);
+        } else if (targetMaxId >= db1MaxIdVal) {
+            long db2ResumeFrom = targetMaxId - db1MaxIdVal;
+            if (db2ResumeFrom > 0) {
+                log.info("  DB1 complete. Resuming DB2 from id > {} (target maxId={})", db2ResumeFrom, targetMaxId);
+                db2Count = serverSideCopyDb2(target, db2Schema, tableName, cols, db2OffsetMap,
+                        "WHERE id > " + db2ResumeFrom);
+            } else {
+                db2Count = serverSideCopyDb2(target, db2Schema, tableName, cols, db2OffsetMap, null);
+            }
+            log.info("  Copied {} rows from DB2 (server-side)", db2Count);
+        }
+
+        log.info("  Copied {} from DB1, {} from DB2 (DB2 server-side)", db1Count, db2Count);
+        return db1Count + db2Count;
+    }
+
+    /**
      * Like resumableCopy but uses streamingCopyWithSkipAndCommit for tables with plate/location dedup.
      * Server-side mode uses WHERE id NOT IN (...) for DB1 skip IDs.
      */
@@ -1971,7 +2212,8 @@ public class DatabaseMerger {
     public void runMerge(String db1Url, String db1Username, String db1Password,
                          String db2Url, String db2Username, String db2Password,
                          String targetUrl, String targetUsername, String targetPassword,
-                         boolean skipSchema, boolean testMode, boolean resume, boolean serverSide) throws Exception {
+                         boolean skipSchema, boolean testMode, boolean resume,
+                         boolean serverSide, boolean serverSideDb2) throws Exception {
         if (testMode) {
             testRowLimit = 10;
             log.info("*** TEST MODE: limiting to {} rows per table (tier 1+) ***", testRowLimit);
@@ -2013,6 +2255,23 @@ public class DatabaseMerger {
                 } else {
                     useServerSide = true;
                     log.info("*** SERVER-SIDE MODE: DB1 tables will be transferred via INSERT INTO...SELECT (server: {}) ***", db1Host);
+                }
+            }
+
+            // Detect and validate server-side transfer mode for DB2
+            if (serverSideDb2) {
+                String db2Host = mysqlHostPort(db2Url);
+                String targetHost2 = mysqlHostPort(targetUrl);
+                db2Schema = dbNameFromUrl(db2Url);
+                if (db2Host == null || targetHost2 == null) {
+                    log.warn("--server-side-db2 requires both DB2 and target to be MySQL. Falling back to standard mode.");
+                } else if (!db2Host.equalsIgnoreCase(targetHost2)) {
+                    log.warn("--server-side-db2: DB2 ({}) and target ({}) are on different servers. Falling back to standard mode.", db2Host, targetHost2);
+                } else if (!testCrossDbAccess(target, db2Schema)) {
+                    log.warn("--server-side-db2: target connection cannot SELECT from {}. Falling back to standard mode.", db2Schema);
+                } else {
+                    useServerSideDb2 = true;
+                    log.info("*** SERVER-SIDE DB2 MODE: eligible DB2 tables will be transferred via INSERT INTO...SELECT (server: {}) ***", db2Host);
                 }
             }
 
@@ -2229,11 +2488,17 @@ public class DatabaseMerger {
             if (msg != null && (msg.contains("Communications link failure") ||
                     msg.contains("connection") && msg.contains("closed") ||
                     msg.contains("Socket") && msg.contains("timeout") ||
-                    msg.contains("No operations allowed after connection closed"))) {
+                    msg.contains("No operations allowed after connection closed") ||
+                    msg.contains("connection was unexpectedly lost") ||
+                    msg.contains("Can not read response from server") ||
+                    msg.contains("unexpected end of stream") ||
+                    msg.contains("Connection reset") ||
+                    msg.contains("No space left on device"))) {
                 return true;
             }
             if (className.contains("CommunicationsException") ||
-                    className.contains("ConnectionIsClosedException")) {
+                    className.contains("ConnectionIsClosedException") ||
+                    className.contains("EOFException")) {
                 return true;
             }
             t = t.getCause();
@@ -3113,12 +3378,17 @@ public class DatabaseMerger {
         db1MaxIds.put("gelimages", db1MaxId);
         final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
+        Map<String, Long> db2Offsets = new HashMap<>();
+        db2Offsets.put("id", db1MaxId);
+        db2Offsets.put("plate", plateOffset);
+
         resumableCopy(conn1, conn2, target, "gelimages", cols, insertSql, colNames,
                 null,
                 row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "plate", plateOffset);
-                });
+                },
+                db2Offsets);
     }
 
     private void mergePlate(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -3229,20 +3499,22 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "gel_quantification");
         db1MaxIds.put("gel_quantification", db1MaxId);
-
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM gel_quantification ORDER BY id"),
-                target, insertSql, colNames, null);
         final long extractionOffset = db1MaxIds.getOrDefault("extraction", 0L);
         final long plateOffset = db1MaxIds.getOrDefault("plate", 0L);
 
-        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM gel_quantification ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        Map<String, Long> db2Offsets = new HashMap<>();
+        db2Offsets.put("id", db1MaxId);
+        db2Offsets.put("extractionid", extractionOffset);
+        db2Offsets.put("plate", plateOffset);
+
+        resumableCopy(conn1, conn2, target, "gel_quantification", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "extractionid", extractionOffset);
                     applyOffset(row, "plate", plateOffset);
-                });
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+                },
+                db2Offsets);
     }
 
     private void mergeAssembly(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -3258,23 +3530,25 @@ public class DatabaseMerger {
 
         long db1MaxId = maxId(conn1, "assembly");
         db1MaxIds.put("assembly", db1MaxId);
-
-        long db1Count = streamingCopy(conn1, limitSql("SELECT " + cols + " FROM assembly ORDER BY id"),
-                target, insertSql, colNames, null);
         final long workflowOffset = db1MaxIds.getOrDefault("workflow", 0L);
         final long frOffset = db1MaxIds.getOrDefault("failure_reason", 0L);
 
-        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM assembly ORDER BY id"),
-                target, insertSql, colNames, row -> {
+        Map<String, Long> db2Offsets = new HashMap<>();
+        db2Offsets.put("id", db1MaxId);
+        db2Offsets.put("workflow", workflowOffset);
+        db2Offsets.put("failure_reason", frOffset);
+
+        resumableCopy(conn1, conn2, target, "assembly", cols, insertSql, colNames,
+                null,
+                row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "workflow", workflowOffset);
                     Object frVal = row.get("failure_reason");
                     if (frVal != null) {
                         row.put("failure_reason", ((Number) frVal).intValue() + (int) frOffset);
                     }
-                });
-
-        log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
+                },
+                db2Offsets);
     }
 
     private void mergePcr(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -3354,12 +3628,17 @@ public class DatabaseMerger {
         db1MaxIds.put("traces", db1MaxId);
         final long csOffset = db1MaxIds.getOrDefault("cyclesequencing", 0L);
 
+        Map<String, Long> db2Offsets = new HashMap<>();
+        db2Offsets.put("id", db1MaxId);
+        db2Offsets.put("reaction", csOffset);
+
         resumableCopy(conn1, conn2, target, "traces", cols, insertSql, colNames,
                 null,
                 row -> {
                     row.put("id", ((Number) row.get("id")).intValue() + (int) db1MaxId);
                     applyOffset(row, "reaction", csOffset);
-                });
+                },
+                db2Offsets);
     }
 
     private void mergeSequencingResult(Connection conn1, Connection conn2, Connection target) throws SQLException {
@@ -3380,11 +3659,20 @@ public class DatabaseMerger {
         final long csOffset = db1MaxIds.getOrDefault("cyclesequencing", 0L);
         final long assemblyOffset = db1MaxIds.getOrDefault("assembly", 0L);
 
-        long db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM sequencing_result"),
-                target, insertSql, colNames, row -> {
-                    applyOffset(row, "reaction", csOffset);
-                    applyOffset(row, "assembly", assemblyOffset);
-                });
+        long db2Count;
+        if (useServerSideDb2) {
+            Map<String, Long> db2Offsets = new HashMap<>();
+            db2Offsets.put("reaction", csOffset);
+            db2Offsets.put("assembly", assemblyOffset);
+            db2Count = serverSideCopyDb2(target, db2Schema, "sequencing_result", cols, db2Offsets, null);
+            log.info("  Copied {} rows from DB2 (server-side)", db2Count);
+        } else {
+            db2Count = streamingCopy(conn2, limitSql("SELECT " + cols + " FROM sequencing_result"),
+                    target, insertSql, colNames, row -> {
+                        applyOffset(row, "reaction", csOffset);
+                        applyOffset(row, "assembly", assemblyOffset);
+                    });
+        }
 
         log.info("  Copied {} from DB1, {} from DB2", db1Count, db2Count);
     }

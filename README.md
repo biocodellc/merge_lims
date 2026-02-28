@@ -211,6 +211,7 @@ java -jar build/libs/db-merger-1.0.0-all.jar merge --skip-schema --test
 | `--test` | `test.mode=true` | Copy only 10 rows per table for tier 1 and above. Setup and dedup tables are copied in full to preserve FK integrity. |
 | `--resume` | `resume=true` | Resume a previously interrupted merge from where it left off. |
 | `--server-side` | `server.side=true` | Use `INSERT INTO...SELECT` for DB1 tables when DB1 and target are on the same MySQL server. |
+| `--server-side-db2` | `server.side.db2=true` | Use `INSERT INTO...SELECT` with offset arithmetic for eligible DB2 tables (same server required). |
 
 ## Server-Side Transfer
 
@@ -218,24 +219,33 @@ When DB1 and the target database are on the same MySQL server, `--server-side` t
 
 ```bash
 gradle merge -PserverSide
-# or
-java -jar db-merger.jar merge --server-side
+# or both DB1 and DB2 server-side:
+gradle merge -PserverSide -PserverSideDb2
+# or just DB2:
+gradle merge -PserverSideDb2
 ```
 
 The merger automatically validates server-side mode at startup:
-1. Both DB1 and target must be MySQL (not SQLite)
+1. Both the source DB and target must be MySQL (not SQLite)
 2. The host:port parsed from both JDBC URLs must match
-3. The target connection must have SELECT access to the DB1 database (tested with a probe query)
+3. The target connection must have SELECT access to the source database (tested with a probe query)
 
 If any check fails, it falls back to standard mode with a warning.
 
-**What uses server-side transfer:**
+**What uses `--server-side` (DB1):**
 - All DB1 table copies that don't require row transformation (failure_reason, gelimages, pcr_thermocycle, cyclesequencing_thermocycle, plate, extraction, workflow, gel_quantification, assembly, pcr, cyclesequencing, traces, sequencing_result)
+- Cocktail and thermocycle tables are copied server-side with a post-copy UPDATE for name prefixing
 - For tables with plate/location dedup, `WHERE id NOT IN (...)` excludes the skip IDs server-side
 
-**What still goes through Java:**
-- All DB2 copies (need ID offset, FK remapping)
-- Cocktail and thermocycle dedup (need row-by-row comparison logic)
+**What uses `--server-side-db2` (DB2):**
+- DB2 tables with simple offset-only transforms: gelimages, gel_quantification, assembly, traces, sequencing_result
+- Uses `SELECT id + offset, ..., fk_col + fk_offset, ...` to apply offsets in SQL
+
+**What always goes through Java:**
+- DB2 tables needing map-based FK remapping: pcr, cyclesequencing (cocktail/thermocycle maps)
+- DB2 workflow (name renumbering logic)
+- DB2 extraction (plate/location dedup skips)
+- Cocktail and thermocycle dedup (row-by-row comparison logic for DB2)
 - Version/properties merge (trivial, just a few rows)
 
 ## Resumable Merges
